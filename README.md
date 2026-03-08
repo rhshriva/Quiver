@@ -14,6 +14,7 @@ A high-performance vector database @ Scale, written in Rust.
 - [CLI](#cli)
 - [Index Types](#index-types)
 - [Distance Metrics](#distance-metrics)
+- [Python Bindings](#python-bindings)
 - [Development Setup](#development-setup)
 - [Building on macOS](#building-on-macos)
 
@@ -112,6 +113,7 @@ Store molecular fingerprint vectors and retrieve structurally similar compounds
 | `vectordb-core`    | Index trait, FlatIndex, HnswIndex, distance metrics |
 | `vectordb-server`  | REST API server (collections, upsert, search, delete) |
 | `vectordb-cli`     | `vdb` command-line client |
+| `vectordb-python`  | PyO3 Python bindings (`FlatIndex`, `HnswIndex`) |
 
 ---
 
@@ -135,6 +137,70 @@ Binaries land in `target/release/`:
 ```
 
 Set `RUST_LOG=debug` for verbose output.
+
+---
+
+## Python Bindings
+
+The `vectordb-python` crate exposes `FlatIndex` and `HnswIndex` directly to Python via [PyO3](https://pyo3.rs).
+
+### Install
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+maturin develop --release   # builds and installs into the active venv
+```
+
+### Usage
+
+```python
+import vectordb
+
+# --- FlatIndex (exact search) ---
+idx = vectordb.FlatIndex(dimensions=3, metric="cosine")
+idx.add(1, [1.0, 0.0, 0.0])
+idx.add(2, [0.0, 1.0, 0.0])
+idx.add_batch([(3, [0.0, 0.0, 1.0]), (4, [1.0, 1.0, 0.0])])
+
+results = idx.search([1.0, 0.0, 0.0], k=2)
+# [{"id": 1, "distance": 0.0}, {"id": 4, "distance": ...}]
+
+idx.delete(4)
+print(len(idx))          # 3
+print(idx.dimensions)    # 3
+print(idx.metric)        # "cosine"
+
+# Persist to disk
+idx.save("my_index.json")
+idx2 = vectordb.FlatIndex.load("my_index.json")
+
+# --- HnswIndex (approximate search) ---
+hnsw = vectordb.HnswIndex(dimensions=128, metric="l2", ef_construction=200, ef_search=50, m=12)
+hnsw.add_batch([(i, [float(i)] * 128) for i in range(10_000)])
+hnsw.flush()   # build the HNSW graph
+
+results = hnsw.search([0.0] * 128, k=5)
+hnsw.save("hnsw.json")
+hnsw2 = vectordb.HnswIndex.load("hnsw.json")  # graph rebuilt automatically
+```
+
+### API reference
+
+| Class | Method / property | Description |
+|-------|-------------------|-------------|
+| `FlatIndex(dimensions, metric="l2")` | constructor | Create exact index |
+| `HnswIndex(dimensions, metric="l2", ef_construction=200, ef_search=50, m=12)` | constructor | Create ANN index |
+| both | `.add(id, vector)` | Insert one vector |
+| both | `.add_batch([(id, vector), ...])` | Insert many vectors |
+| both | `.search(query, k)` → `list[dict]` | Return k nearest neighbours |
+| both | `.delete(id)` → `bool` | Remove a vector |
+| both | `.save(path)` | Persist index to JSON |
+| both | `cls.load(path)` | Restore index from JSON |
+| both | `len(idx)` | Number of stored vectors |
+| both | `.dimensions`, `.metric` | Read-only properties |
+| `HnswIndex` | `.flush()` | Rebuild HNSW graph immediately |
+
+Metrics: `"l2"`, `"cosine"`, `"dot_product"`.
 
 ---
 
@@ -300,6 +366,8 @@ VDB_HOST=http://my-server:8080 vdb list
 |-------|--------|------------------|------------------|----------|
 | `flat` | 100% | O(N · D) | O(N) | < 100 K vectors, ground-truth eval |
 | `hnsw` | ~95–99% (tunable) | O(log N · ef) | O(N · M · log N) | > 100 K vectors, latency-sensitive |
+
+Both index types support disk persistence via `save` / `load` (JSON format). For `HnswIndex`, the graph is not stored — it is rebuilt automatically on load, so the loaded index is immediately ready for ANN search.
 
 ### HNSW tuning
 
