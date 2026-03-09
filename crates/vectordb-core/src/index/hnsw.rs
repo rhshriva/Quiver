@@ -311,6 +311,14 @@ impl VectorIndex for HnswIndex {
     fn config(&self) -> &IndexConfig {
         &self.config
     }
+
+    fn iter_vectors(&self) -> Box<dyn Iterator<Item = (u64, Vec<f32>)> + '_> {
+        Box::new(self.all_vectors.iter().map(|(&id, v)| (id, v.clone())))
+    }
+
+    fn flush(&mut self) {
+        HnswIndex::flush(self);
+    }
 }
 
 #[cfg(test)]
