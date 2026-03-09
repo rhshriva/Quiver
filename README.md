@@ -1,20 +1,23 @@
 # vectordb
 
-A high-performance vector database @ Scale, written in Rust.
+A high-performance vector database written in Rust — available as an **embedded Python library** or a **standalone HTTP server**.
 
 ---
 
 ## Table of Contents
 
 - [Overview](#overview)
-- [Use Cases](#use-cases)
-- [Architecture](#architecture)
-- [Getting Started](#getting-started)
-- [REST API](#rest-api)
+- [Two Ways to Use vectordb](#two-ways-to-use-vectordb)
+- [Offering 1: Embedded Python Library](#offering-1-embedded-python-library)
+- [Offering 2: HTTP Server](#offering-2-http-server)
+- [Payload Metadata & Filtered Search](#payload-metadata--filtered-search)
+- [Persistence & Durability](#persistence--durability)
+- [REST API Reference](#rest-api-reference)
 - [CLI](#cli)
 - [Index Types](#index-types)
 - [Distance Metrics](#distance-metrics)
-- [Python Bindings](#python-bindings)
+- [Low-Level Python Bindings](#low-level-python-bindings)
+- [Architecture](#architecture)
 - [Development Setup](#development-setup)
 - [Building on macOS](#building-on-macos)
 
@@ -22,268 +25,343 @@ A high-performance vector database @ Scale, written in Rust.
 
 ## Overview
 
-**vectordb** stores, indexes, and searches high-dimensional vectors at scale.
-It exposes a simple HTTP/JSON API (backed by [Axum](https://github.com/tokio-rs/axum))
-and ships a CLI (`vdb`) for quick interaction. The core engine is a pluggable
-`VectorIndex` trait with two built-in implementations — an exact `FlatIndex`
-and an approximate HNSW index powered by [instant-distance](https://github.com/InstantDomainSearch/instant-distance).
+**vectordb** stores, indexes, and searches high-dimensional vectors at scale. It supports:
+
+- **Exact search** via `FlatIndex` (brute-force, 100% recall)
+- **Approximate search** via `HnswIndex` (graph-based ANN, ~95–99% recall, sub-linear time)
+- **Payload metadata** attached to every vector — filter search results by arbitrary JSON fields
+- **WAL-based persistence** — all writes survive process restarts automatically
+- **Two deployment modes** — embedded Python library or standalone HTTP server
 
 ---
 
-## Use Cases
+## Two Ways to Use vectordb
 
-### 1. Semantic Search
-Embed documents, web pages, or knowledge-base articles with a text embedding
-model (e.g. `text-embedding-3-small`). Store the embeddings in vectordb and
-retrieve the most semantically relevant results for any natural-language query —
-no keyword matching required.
+### Which should I choose?
 
-```
-User query → embedding model → query vector
-→ vectordb search (top-k) → relevant documents
-```
-
-### 2. Recommendation Systems
-Convert user behaviour (clicks, purchases, ratings) or item attributes into
-latent vectors and find the nearest neighbours to power "you may also like"
-or "users like you also bought" features.
-
-### 3. Image & Multimodal Search
-Store CLIP or similar vision embeddings for images, videos, or audio clips.
-Search by uploading a new image or text description to find visually or
-semantically similar media instantly.
-
-### 4. Retrieval-Augmented Generation (RAG)
-Pair vectordb with a large language model to build RAG pipelines. At query
-time, retrieve the most relevant context chunks from your corpus and inject
-them into the LLM prompt — grounding responses in up-to-date or proprietary
-knowledge.
-
-```
-User question
- → embed → vectordb kNN search → top-k context chunks
- → LLM prompt + context → grounded answer
-```
-
-### 5. Anomaly & Fraud Detection
-Embed transactional or behavioural events and flag items whose nearest-neighbour
-distance exceeds a threshold as potential anomalies — useful for fraud
-detection, intrusion detection, and quality control.
-
-### 6. Duplicate & Near-Duplicate Detection
-Hash or embed content (text, code, images) and perform a similarity search to
-surface near-duplicates before ingesting them, enabling deduplication pipelines
-at scale.
-
-### 7. Clustering & Exploratory Data Analysis
-Use vectordb as a fast kNN oracle for clustering algorithms (k-means, DBSCAN,
-HDBSCAN) over large embedding datasets without loading everything into memory.
-
-### 8. Drug Discovery & Molecular Search
-Store molecular fingerprint vectors and retrieve structurally similar compounds
-— accelerating virtual screening and lead optimisation workflows.
+| | Embedded Python | HTTP Server |
+|---|---|---|
+| **Setup** | `pip install` + one line of code | Start a binary |
+| **Process** | Runs in your Python process | Separate service |
+| **Use case** | Scripts, notebooks, ML pipelines | Multi-client, microservices |
+| **Networking** | None (in-process) | HTTP/JSON |
+| **Language** | Python | Any language |
+| **Persistence** | Yes (WAL on disk) | Yes (WAL on disk) |
 
 ---
 
-## Architecture
+## Offering 1: Embedded Python Library
 
-```
-┌────────────────────────────────────────┐
-│            vectordb-server             │  HTTP/JSON (port 8080)
-│              (Axum + Tokio)            │
-└────────────────┬───────────────────────┘
-                 │ calls
-┌────────────────▼───────────────────────┐
-│            vectordb-core               │
-│  ┌──────────────┐  ┌────────────────┐  │
-│  │  FlatIndex   │  │   HnswIndex    │  │
-│  │  (exact L2/  │  │  (ANN, ~95-99% │  │
-│  │  cosine/dot) │  │   recall)      │  │
-│  └──────────────┘  └────────────────┘  │
-│         implements VectorIndex trait   │
-└────────────────────────────────────────┘
-         ▲
-┌────────┴───────┐
-│  vectordb-cli  │  `vdb` binary — talks to the server over HTTP
-└────────────────┘
-```
-
-| Crate              | Role |
-|--------------------|------|
-| `vectordb-core`    | Index trait, FlatIndex, HnswIndex, distance metrics |
-| `vectordb-server`  | REST API server (collections, upsert, search, delete) |
-| `vectordb-cli`     | `vdb` command-line client |
-| `vectordb-python`  | PyO3 Python bindings (`FlatIndex`, `HnswIndex`) |
-
----
-
-## Getting Started
-
-### Build
-
-```bash
-cargo build --release
-```
-
-Binaries land in `target/release/`:
-- `vectordb-server` — the HTTP server
-- `vdb` — the CLI client
-
-### Run the server
-
-```bash
-./target/release/vectordb-server
-# INFO vectordb-server listening on 0.0.0.0:8080
-```
-
-Set `RUST_LOG=debug` for verbose output.
-
----
-
-## Python Bindings
-
-The `vectordb-python` crate exposes `FlatIndex` and `HnswIndex` directly to Python via [PyO3](https://pyo3.rs).
+The `vectordb.Client` API runs the database entirely inside your Python process — no server to start.
 
 ### Install
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
-maturin develop --release   # builds and installs into the active venv
+pip install maturin
+maturin develop --release   # build and install into the active venv
 ```
 
-### Usage
+### Quickstart
 
 ```python
 import vectordb
 
-# --- FlatIndex (exact search) ---
-idx = vectordb.FlatIndex(dimensions=3, metric="cosine")
-idx.add(1, [1.0, 0.0, 0.0])
-idx.add(2, [0.0, 1.0, 0.0])
-idx.add_batch([(3, [0.0, 0.0, 1.0]), (4, [1.0, 1.0, 0.0])])
+# Open (or create) a database at the given path.
+# All data is persisted to disk automatically.
+db = vectordb.Client(path="./mydata")
 
-results = idx.search([1.0, 0.0, 0.0], k=2)
-# [{"id": 1, "distance": 0.0}, {"id": 4, "distance": ...}]
+# Create a collection (or retrieve it next time)
+col = db.create_collection("articles", dimensions=3, metric="cosine")
 
-idx.delete(4)
-print(len(idx))          # 3
-print(idx.dimensions)    # 3
-print(idx.metric)        # "cosine"
+# Insert vectors with optional metadata payload
+col.upsert(1, [1.0, 0.0, 0.0], payload={"category": "tech",  "year": 2024})
+col.upsert(2, [0.0, 1.0, 0.0], payload={"category": "sport", "year": 2023})
+col.upsert(3, [0.9, 0.1, 0.0], payload={"category": "tech",  "year": 2023})
+col.upsert(4, [0.1, 0.9, 0.0], payload={"category": "sport", "year": 2024})
 
-# Persist to disk
-idx.save("my_index.json")
-idx2 = vectordb.FlatIndex.load("my_index.json")
+# Plain search — returns top-k with distance and payload
+results = col.search([1.0, 0.0, 0.0], k=2)
+# [{"id": 1, "distance": 0.0,   "payload": {"category": "tech", "year": 2024}},
+#  {"id": 3, "distance": 0.02,  "payload": {"category": "tech", "year": 2023}}]
 
-# --- HnswIndex (approximate search) ---
-hnsw = vectordb.HnswIndex(dimensions=128, metric="l2", ef_construction=200, ef_search=50, m=12)
-hnsw.add_batch([(i, [float(i)] * 128) for i in range(10_000)])
-hnsw.flush()   # build the HNSW graph
+# Filtered search — only return vectors whose payload matches
+results = col.search(
+    [1.0, 0.0, 0.0],
+    k=5,
+    filter={"category": {"$eq": "tech"}},
+)
+# Only "tech" articles, still ranked by vector distance
 
-results = hnsw.search([0.0] * 128, k=5)
-hnsw.save("hnsw.json")
-hnsw2 = vectordb.HnswIndex.load("hnsw.json")  # graph rebuilt automatically
+# Combine filters with $and / $or
+results = col.search(
+    [1.0, 0.0, 0.0],
+    k=5,
+    filter={"$and": [
+        {"category": {"$eq": "tech"}},
+        {"year":     {"$gte": 2024}},
+    ]},
+)
 ```
 
-### API reference
+### Persistence across restarts
 
-| Class | Method / property | Description |
-|-------|-------------------|-------------|
-| `FlatIndex(dimensions, metric="l2")` | constructor | Create exact index |
-| `HnswIndex(dimensions, metric="l2", ef_construction=200, ef_search=50, m=12)` | constructor | Create ANN index |
-| both | `.add(id, vector)` | Insert one vector |
-| both | `.add_batch([(id, vector), ...])` | Insert many vectors |
-| both | `.search(query, k)` → `list[dict]` | Return k nearest neighbours |
-| both | `.delete(id)` → `bool` | Remove a vector |
-| both | `.save(path)` | Persist index to JSON |
-| both | `cls.load(path)` | Restore index from JSON |
-| both | `len(idx)` | Number of stored vectors |
-| both | `.dimensions`, `.metric` | Read-only properties |
-| `HnswIndex` | `.flush()` | Rebuild HNSW graph immediately |
+```python
+import vectordb
 
-Metrics: `"l2"`, `"cosine"`, `"dot_product"`.
+# First run — insert data
+db = vectordb.Client(path="./mydata")
+col = db.create_collection("docs", dimensions=768, metric="cosine")
+col.upsert(1, embedding_of("hello world"), payload={"text": "hello world"})
+
+# Second run — data is automatically reloaded from disk
+db = vectordb.Client(path="./mydata")
+col = db.get_collection("docs")
+print(col.count)  # 1 — survived the restart
+```
+
+### Managing collections
+
+```python
+db = vectordb.Client(path="./mydata")
+
+# List all collections
+names = db.list_collections()           # ["docs", "images"]
+
+# Get an existing collection
+col = db.get_collection("docs")
+
+# Get if exists, create if not (idempotent)
+col = db.get_or_create_collection("docs", dimensions=768, metric="cosine")
+
+# Delete a collection and all its data
+db.delete_collection("docs")           # returns True if found
+```
+
+### Client & Collection API
+
+**`vectordb.Client(path="./data")`**
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `create_collection(name, dimensions, metric="cosine", index_type="hnsw")` | `Collection` | Create a new collection |
+| `get_collection(name)` | `Collection` | Get existing collection (raises `KeyError` if not found) |
+| `get_or_create_collection(name, dimensions, metric="cosine")` | `Collection` | Create if absent |
+| `delete_collection(name)` | `bool` | Delete collection and all data |
+| `list_collections()` | `list[str]` | Names of all collections |
+
+**`vectordb.Collection`**
+
+| Method / property | Description |
+|-------------------|-------------|
+| `upsert(id, vector, payload=None)` | Add or replace a vector |
+| `search(query, k, filter=None)` → `list[dict]` | kNN search with optional filter |
+| `delete(id)` → `bool` | Remove a vector |
+| `count` | Number of stored vectors |
+| `name` | Collection name |
 
 ---
 
-## Development Setup
+## Offering 2: HTTP Server
 
-### 1. Prerequisites
+Run `vectordb-server` as a standalone service and call it from any language over HTTP.
 
-```bash
-# Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source ~/.cargo/env
-
-# Python 3.8+ and maturin (only needed for Python bindings)
-brew install python          # macOS; use apt/dnf on Linux
-pip install maturin
-```
-
-### 2. Clone and branch
+### Start the server
 
 ```bash
-git clone https://github.com/vectordb/vectordb.git
-cd vectordb
-git checkout -b feat/my-change origin/main   # or an existing branch
+# Build
+cargo build --release
+
+# Run (data persisted to ./data by default)
+./target/release/vectordb-server
+# INFO vectordb-server listening on 0.0.0.0:8080
+
+# Custom data directory
+VECTORDB_DATA_DIR=/var/lib/vectordb ./target/release/vectordb-server
+
+# With API key authentication
+VECTORDB_API_KEY=mysecretkey ./target/release/vectordb-server
 ```
 
-### 3. Python virtual environment
-
-Skip if you only need the Rust server/CLI.
+### End-to-end example with curl
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
-pip install maturin
+# Create a collection
+curl -s -X POST http://localhost:8080/collections/articles \
+  -H "Content-Type: application/json" \
+  -d '{"dimensions": 3, "metric": "cosine", "index_type": "flat"}'
+
+# Insert vectors with payload metadata
+curl -s -X POST http://localhost:8080/collections/articles/vectors \
+  -H "Content-Type: application/json" \
+  -d '{"id": 1, "vector": [1.0, 0.0, 0.0], "payload": {"category": "tech", "year": 2024}}'
+
+curl -s -X POST http://localhost:8080/collections/articles/vectors \
+  -H "Content-Type: application/json" \
+  -d '{"id": 2, "vector": [0.0, 1.0, 0.0], "payload": {"category": "sport", "year": 2023}}'
+
+# Plain search
+curl -s -X POST http://localhost:8080/collections/articles/search \
+  -H "Content-Type: application/json" \
+  -d '{"vector": [1.0, 0.0, 0.0], "k": 2}'
+# {"results":[{"id":1,"distance":0.0,"payload":{"category":"tech","year":2024}}, ...]}
+
+# Filtered search — only tech articles
+curl -s -X POST http://localhost:8080/collections/articles/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "vector": [1.0, 0.0, 0.0],
+    "k": 5,
+    "filter": {"category": {"$eq": "tech"}}
+  }'
+
+# Compound filter
+curl -s -X POST http://localhost:8080/collections/articles/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "vector": [1.0, 0.0, 0.0],
+    "k": 5,
+    "filter": {"$and": [
+      {"category": {"$eq": "tech"}},
+      {"year":     {"$gte": 2024}}
+    ]}
+  }'
+
+# Delete a vector
+curl -s -X DELETE http://localhost:8080/collections/articles/vectors/1
+
+# Delete the collection
+curl -s -X DELETE http://localhost:8080/collections/articles
 ```
 
-### 4. Build
+### API key authentication
+
+When `VECTORDB_API_KEY` is set, every request must include the key as a Bearer token:
 
 ```bash
-# Rust (server + CLI)
-cargo build
+VECTORDB_API_KEY=mysecretkey ./target/release/vectordb-server
 
-# Python bindings (venv must be active)
-maturin develop
-python3 -c "import vectordb; print('OK')"   # verify
+# Authenticated request
+curl -s http://localhost:8080/collections \
+  -H "Authorization: Bearer mysecretkey"
+
+# Missing / wrong key → 401 Unauthorized
+curl -s http://localhost:8080/collections
+# {"error":"invalid or missing API key"}
 ```
 
-> **macOS:** if `cargo build` fails with undefined Python symbols, see
-> [Building on macOS](#building-on-macos).
+When `VECTORDB_API_KEY` is **not** set, the server runs in dev mode — all requests are allowed without authentication.
 
-### 5. Test and run
+---
 
-```bash
-cargo test                                   # run all tests
-RUST_LOG=debug cargo run -p vectordb-server  # start dev server
-./target/debug/vdb list                      # use the CLI
+## Payload Metadata & Filtered Search
+
+Every vector can carry an arbitrary JSON payload. Payloads are stored alongside the vector and returned in search results.
+
+### Upsert with payload
+
+```json
+POST /collections/docs/vectors
+{
+  "id": 42,
+  "vector": [0.1, 0.2, 0.3],
+  "payload": {
+    "title": "Introduction to Rust",
+    "author": "Alice",
+    "tags": ["rust", "systems"],
+    "score": 0.95
+  }
+}
 ```
 
-### Project structure
+The `payload` field is optional — existing clients that omit it continue to work unchanged.
 
-```
-crates/
-├── vectordb-core/     # index trait, FlatIndex, HnswIndex
-├── vectordb-server/   # Axum HTTP server
-├── vectordb-cli/      # vdb CLI binary
-└── vectordb-python/   # PyO3 Python bindings
+### Filter syntax
+
+Filters are applied after the ANN search (post-filtering with 10× overscan). The filter format uses MongoDB-style operators:
+
+| Operator | Meaning | Example |
+|----------|---------|---------|
+| `$eq` | Equal | `{"field": {"$eq": "value"}}` |
+| `$ne` | Not equal | `{"field": {"$ne": "value"}}` |
+| `$in` | One of | `{"field": {"$in": ["a", "b"]}}` |
+| `$gt` | Greater than | `{"score": {"$gt": 0.5}}` |
+| `$gte` | Greater than or equal | `{"year": {"$gte": 2020}}` |
+| `$lt` | Less than | `{"score": {"$lt": 0.9}}` |
+| `$lte` | Less than or equal | `{"year": {"$lte": 2024}}` |
+| `$and` | All conditions true | `{"$and": [cond1, cond2]}` |
+| `$or` | Any condition true | `{"$or": [cond1, cond2]}` |
+
+Dot-notation field paths are supported: `"meta.author"` matches `{"meta": {"author": "alice"}}`.
+
+Missing fields and type mismatches return `false` (the vector is excluded from results) — they do not raise errors.
+
+### Filter examples
+
+```json
+// Single field equality
+{"category": {"$eq": "tech"}}
+
+// Numeric range
+{"score": {"$gte": 0.8}}
+
+// Member of a set
+{"status": {"$in": ["published", "featured"]}}
+
+// Compound: tech articles from 2024 onwards
+{"$and": [
+  {"category": {"$eq": "tech"}},
+  {"year":     {"$gte": 2024}}
+]}
+
+// Either category
+{"$or": [
+  {"category": {"$eq": "tech"}},
+  {"category": {"$eq": "science"}}
+]}
+
+// Nested field via dot-notation
+{"meta.author": {"$eq": "alice"}}
 ```
 
 ---
 
-## REST API
+## Persistence & Durability
 
-All requests and responses use `application/json`.
+vectordb uses a **write-ahead log (WAL)** for durability. Every upsert and delete is appended to an NDJSON log file before the in-memory index is updated.
+
+### What this means for you
+
+- **Crash-safe** — if the process dies mid-write, the partial entry is silently skipped on restart; all prior entries are replayed intact.
+- **Automatic** — no `save()` or `flush()` calls needed. Just write vectors and restart freely.
+- **Transparent** — data is stored in `{VECTORDB_DATA_DIR}/{collection_name}/`:
+  ```
+  ./data/
+    articles/
+      meta.json     ← collection config (dimensions, metric, index type)
+      wal.log       ← append-only NDJSON journal
+  ```
+
+### WAL compaction
+
+The WAL is automatically compacted (rewritten to contain only live entries) when it exceeds 50 000 entries. Compaction uses an atomic rename — if the process crashes during compaction, the original log is untouched.
+
+---
+
+## REST API Reference
+
+All endpoints consume and produce `application/json`.
 
 ### Collections
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/collections` | List all collections |
+| `GET` | `/collections` | List all collection names |
 | `POST` | `/collections/:name` | Create a collection |
 | `GET` | `/collections/:name` | Get collection info |
-| `DELETE` | `/collections/:name` | Delete a collection |
+| `DELETE` | `/collections/:name` | Delete a collection and all its vectors |
 
-**Create collection body:**
+**Create collection:**
 ```json
 {
   "dimensions": 1536,
@@ -308,25 +386,35 @@ All requests and responses use `application/json`.
 | `POST` | `/collections/:name/search` | kNN search |
 | `DELETE` | `/collections/:name/vectors/:id` | Delete a vector |
 
-**Upsert body:**
+**Upsert:**
 ```json
-{ "id": 42, "vector": [0.1, 0.2, 0.3, ...] }
+{
+  "id": 42,
+  "vector": [0.1, 0.2, 0.3],
+  "payload": {"title": "optional metadata"}
+}
 ```
 
-**Search body:**
+**Search:**
 ```json
-{ "vector": [0.1, 0.2, 0.3, ...], "k": 10 }
+{
+  "vector": [0.1, 0.2, 0.3],
+  "k": 10,
+  "filter": {"category": {"$eq": "tech"}}
+}
 ```
 
 **Search response:**
 ```json
 {
   "results": [
-    { "id": 7,  "distance": 0.012 },
-    { "id": 99, "distance": 0.034 }
+    {"id": 1, "distance": 0.012, "payload": {"category": "tech"}},
+    {"id": 7, "distance": 0.034, "payload": {"category": "tech"}}
   ]
 }
 ```
+
+Vectors without a payload omit the `payload` key in the response. The `filter` field in search requests is optional — omitting it returns all candidates.
 
 ---
 
@@ -338,14 +426,12 @@ All requests and responses use `application/json`.
 
 ```bash
 cargo build --release
-# binary lands at target/release/vdb
+# binary: target/release/vdb
 ```
-
-Add `target/release` to your `$PATH`, or run it as `./target/release/vdb`.
 
 ### Server URL
 
-By default `vdb` connects to `http://localhost:8080`. Override with `--host` or the `VDB_HOST` environment variable:
+Default: `http://localhost:8080`. Override with `--host` or `VDB_HOST`:
 
 ```bash
 vdb --host http://prod-server:8080 list
@@ -355,73 +441,45 @@ VDB_HOST=http://prod-server:8080 vdb list
 ### Commands
 
 #### `vdb list`
-List all collections.
 ```bash
 vdb list
 ```
 
 #### `vdb create <name>`
-Create a new collection.
-
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--dimensions <N>` | *(required)* | Number of dimensions |
+| `--dimensions <N>` | *(required)* | Vector dimensions |
 | `--metric <m>` | `cosine` | `l2` \| `cosine` \| `dot_product` |
 | `--index <type>` | `hnsw` | `flat` \| `hnsw` |
 
 ```bash
-vdb create my-docs --dimensions 768
-vdb create my-docs --dimensions 768 --metric cosine --index hnsw
-vdb create exact-idx --dimensions 128 --metric l2 --index flat
+vdb create articles --dimensions 768 --metric cosine --index hnsw
 ```
 
 #### `vdb insert <collection>`
-Insert or update a vector (comma-separated floats).
-
 ```bash
-vdb insert my-docs --id 1 --vector "0.1,0.2,0.3"
-vdb insert my-docs --id 42 --vector "0.9,0.1,0.5,0.3"
+vdb insert articles --id 1 --vector "0.1,0.2,0.3"
 ```
 
 #### `vdb search <collection>`
-Search for nearest neighbours. Prints JSON results.
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--vector <floats>` | *(required)* | Comma-separated query vector |
-| `--k <N>` | `5` | Number of neighbours to return |
-
 ```bash
-vdb search my-docs --vector "0.1,0.2,0.3"
-vdb search my-docs --vector "0.1,0.2,0.3" --k 10
+vdb search articles --vector "0.1,0.2,0.3" --k 10
 ```
 
-Output:
-```json
-{
-  "results": [
-    { "id": 1,  "distance": 0.0 },
-    { "id": 99, "distance": 0.042 }
-  ]
-}
-```
-
-#### `vdb delete <collection>`
-Delete a single vector by ID.
+#### `vdb delete <collection> --id <id>`
 ```bash
-vdb delete my-docs --id 42
+vdb delete articles --id 42
 ```
 
 #### `vdb drop <collection>`
-Delete an entire collection.
 ```bash
-vdb drop my-docs
+vdb drop articles
 ```
 
-### End-to-end example
+### End-to-end CLI example
 
 ```bash
-# Start the server
+# Start the server (persists to ./data)
 ./target/release/vectordb-server &
 
 # Create a 3-dimensional collection
@@ -435,7 +493,7 @@ vdb insert colours --id 3 --vector "0.0,0.0,1.0"   # blue
 # Search for the 2 closest to "mostly red"
 vdb search colours --vector "0.9,0.1,0.0" --k 2
 
-# Remove a vector and the collection
+# Clean up
 vdb delete colours --id 3
 vdb drop colours
 ```
@@ -444,12 +502,10 @@ vdb drop colours
 
 ## Index Types
 
-| Index | Recall | Query complexity | Build complexity | Use when |
-|-------|--------|------------------|------------------|----------|
-| `flat` | 100% | O(N · D) | O(N) | < 100 K vectors, ground-truth eval |
-| `hnsw` | ~95–99% (tunable) | O(log N · ef) | O(N · M · log N) | > 100 K vectors, latency-sensitive |
-
-Both index types support disk persistence via `save` / `load` (JSON format). For `HnswIndex`, the graph is not stored — it is rebuilt automatically on load, so the loaded index is immediately ready for ANN search.
+| Index | Recall | Query complexity | Use when |
+|-------|--------|------------------|----------|
+| `flat` | 100% | O(N · D) | < 100 K vectors, ground-truth eval |
+| `hnsw` | ~95–99% (tunable) | O(log N · ef) | > 100 K vectors, latency-sensitive |
 
 ### HNSW tuning
 
@@ -471,149 +527,174 @@ Both index types support disk persistence via `save` / `load` (JSON format). For
 
 ---
 
-## Building on macOS
+## Low-Level Python Bindings
 
-This section covers macOS-specific setup and known issues developers encounter
-when building the project on Apple hardware (both Intel and Apple Silicon).
+For direct, low-level index access without collections or persistence, the original `FlatIndex` and `HnswIndex` classes are still available:
+
+```python
+import vectordb
+
+# --- FlatIndex (exact search) ---
+idx = vectordb.FlatIndex(dimensions=3, metric="cosine")
+idx.add(1, [1.0, 0.0, 0.0])
+idx.add(2, [0.0, 1.0, 0.0])
+idx.add_batch([(3, [0.0, 0.0, 1.0]), (4, [1.0, 1.0, 0.0])])
+
+results = idx.search([1.0, 0.0, 0.0], k=2)
+# [{"id": 1, "distance": 0.0}, {"id": 4, "distance": ...}]
+
+idx.delete(4)
+print(len(idx))       # 3
+print(idx.dimensions) # 3
+print(idx.metric)     # "cosine"
+
+# Persist to disk (JSON snapshot)
+idx.save("my_index.json")
+idx2 = vectordb.FlatIndex.load("my_index.json")
+
+# --- HnswIndex (approximate search) ---
+hnsw = vectordb.HnswIndex(dimensions=128, metric="l2",
+                           ef_construction=200, ef_search=50, m=12)
+hnsw.add_batch([(i, [float(i)] * 128) for i in range(10_000)])
+hnsw.flush()   # build the HNSW graph
+
+results = hnsw.search([0.0] * 128, k=5)
+hnsw.save("hnsw.json")
+hnsw2 = vectordb.HnswIndex.load("hnsw.json")  # graph rebuilt automatically
+```
+
+> **Note:** `FlatIndex` and `HnswIndex` are in-memory only. Use `vectordb.Client` for persistence.
+
+### Low-level API reference
+
+| Class | Method / property | Description |
+|-------|-------------------|-------------|
+| `FlatIndex(dimensions, metric="l2")` | constructor | Create exact index |
+| `HnswIndex(dimensions, metric="l2", ef_construction=200, ef_search=50, m=12)` | constructor | Create ANN index |
+| both | `.add(id, vector)` | Insert one vector |
+| both | `.add_batch([(id, vector), ...])` | Insert many vectors |
+| both | `.search(query, k)` → `list[dict]` | Return k nearest neighbours |
+| both | `.delete(id)` → `bool` | Remove a vector |
+| both | `.save(path)` | Persist index to JSON |
+| both | `cls.load(path)` | Restore index from JSON |
+| both | `len(idx)` | Number of stored vectors |
+| both | `.dimensions`, `.metric` | Read-only properties |
+| `HnswIndex` | `.flush()` | Rebuild HNSW graph immediately |
+
+---
+
+## Architecture
+
+```
+                    ┌────────────────────────────────────────┐
+                    │          vectordb-core (shared)        │
+                    │                                        │
+                    │  Collection  — index + WAL + payloads  │
+                    │  CollectionManager — multi-collection  │
+                    │  WAL         — NDJSON append-only log  │
+                    │  FilterCondition — payload predicates  │
+                    │  FlatIndex / HnswIndex                 │
+                    └──────────────┬─────────────────────────┘
+                                   │
+               ┌───────────────────┴───────────────────────┐
+               │                                           │
+  ┌────────────▼────────────┐            ┌────────────────▼──────────┐
+  │  vectordb-python        │            │  vectordb-server           │
+  │                         │            │                            │
+  │  Client(path=...)       │            │  REST API (Axum + Tokio)   │
+  │  Collection             │            │  VECTORDB_DATA_DIR         │
+  │  FlatIndex (low-level)  │            │  VECTORDB_API_KEY auth     │
+  │  HnswIndex (low-level)  │            │                            │
+  └─────────────────────────┘            └────────────────────────────┘
+      Embedded Python                        Client-Server
+```
+
+| Crate | Role |
+|-------|------|
+| `vectordb-core` | Index trait, FlatIndex, HnswIndex, WAL, Collection, CollectionManager, payload filtering |
+| `vectordb-server` | REST API server with persistence and optional API key auth |
+| `vectordb-cli` | `vdb` command-line client |
+| `vectordb-python` | PyO3 bindings — `Client`, `Collection`, `FlatIndex`, `HnswIndex` |
+
+---
+
+## Development Setup
 
 ### Prerequisites
 
 ```bash
-# Install Rust
+# Rust
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source ~/.cargo/env
 
-# Install Python 3.8+ (Homebrew recommended)
-brew install python
-
-# Install maturin (required for the Python bindings crate)
+# Python 3.8+ and maturin (only needed for Python bindings)
 pip install maturin
 ```
 
-### Building the Rust workspace
+### Build
 
 ```bash
-cargo build --release
-```
+# Rust (server + CLI)
+cargo build
 
-### Building the Python bindings
-
-The `vectordb-python` crate is a PyO3 extension module and **must be built
-with `maturin`**, not plain `cargo build`:
-
-```bash
-# Dev install into your active virtual environment (fast iteration)
+# Python bindings (venv must be active)
+python3 -m venv .venv && source .venv/bin/activate
 maturin develop
-
-# Build a release wheel
-maturin build --release
-pip install target/wheels/vectordb-*.whl
+python3 -c "import vectordb; print('OK')"
 ```
 
-### Apple Silicon (M1/M2/M3) — universal wheel
+### Test
+
+```bash
+cargo test
+```
+
+### Run the dev server
+
+```bash
+RUST_LOG=debug cargo run -p vectordb-server
+```
+
+### Project structure
+
+```
+crates/
+├── vectordb-core/     # index trait, WAL, Collection, CollectionManager, filters
+├── vectordb-server/   # Axum HTTP server
+├── vectordb-cli/      # vdb CLI binary
+└── vectordb-python/   # PyO3 Python bindings
+```
+
+---
+
+## Building on macOS
+
+### Apple Silicon — universal wheel
 
 ```bash
 rustup target add x86_64-apple-darwin aarch64-apple-darwin
 maturin build --release --target universal2-apple-darwin
 ```
 
----
-
 ### Known issues
 
-#### 1. `cargo build` fails with "Undefined symbols for architecture arm64"
+#### `cargo build` fails with "Undefined symbols for architecture arm64"
 
-**Symptom:**
+PyO3 extension modules leave Python symbols unresolved at link time by design. Use `maturin develop` instead of plain `cargo build` for the Python bindings crate. The repository ships `.cargo/config.toml` with `-undefined dynamic_lookup` for macOS targets.
 
-```
-Undefined symbols for architecture arm64:
-  "_PyBaseObject_Type", referenced from: ...
-  "_PyBytes_AsString", referenced from: ...
-  ...
-ld: symbol(s) not found for architecture arm64
-```
-
-**Cause:** PyO3 extension modules intentionally leave Python symbols
-(`_Py*`) unresolved at link time. They are resolved at runtime when
-Python loads the `.so`. Plain `cargo build` does not pass the required
-`-undefined dynamic_lookup` linker flag, so the link step fails.
-
-**Fix:** The repository ships a `.cargo/config.toml` that adds this
-flag automatically for both `aarch64-apple-darwin` and
-`x86_64-apple-darwin` targets. If you still see the error, ensure the
-file is present:
-
-```toml
-# .cargo/config.toml
-[target.aarch64-apple-darwin]
-rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
-
-[target.x86_64-apple-darwin]
-rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
-```
-
-> For building the Python extension the correct tool is always
-> `maturin develop` — it sets this flag automatically regardless of
-> `.cargo/config.toml`.
-
----
-
-#### 2. Python not found / wrong Python picked up
-
-**Symptom:** PyO3's build script prints `error: Python version X.Y is
-not supported` or links against the wrong interpreter.
-
-**Fix:** Point PyO3 at your chosen Python explicitly:
+#### Python not found / wrong Python
 
 ```bash
 export PYO3_PYTHON=$(which python3)
 maturin develop
 ```
 
----
-
-#### 3. pyenv Python missing shared library
-
-**Symptom:** Linker error referencing `libpythonX.Y.dylib` not found,
-or PyO3 build script warning `could not find Python shared library`.
-
-**Cause:** pyenv builds Python without a shared library by default.
-
-**Fix:** Reinstall Python with shared-library support enabled:
+#### pyenv Python missing shared library
 
 ```bash
 PYTHON_CONFIGURE_OPTS="--enable-shared" pyenv install 3.11.9
 pyenv global 3.11.9
 ```
-
----
-
-#### 4. `zsh: unknown sort specifier` when running Python commands
-
-**Symptom:** zsh prints `zsh: unknown sort specifier` after certain
-`python3 -c` invocations.
-
-**Cause:** This is a zsh glob-expansion side effect when the Python
-output contains characters zsh tries to interpret. It does not affect
-the build — wrap the command in quotes or run it inside a subshell to
-suppress it.
-
----
-
-#### 5. Build fails after Xcode / Command Line Tools update
-
-**Symptom:** After updating macOS or Xcode, `cargo build` or `maturin`
-fails with linker errors unrelated to Python.
-
-**Fix:** Reinstall the Command Line Tools:
-
-```bash
-sudo xcode-select --reset
-xcode-select --install
-```
-
-Then re-run `rustup show` to confirm the active toolchain is still
-targeting `aarch64-apple-darwin` or `x86_64-apple-darwin` as expected.
 
 ---
 
