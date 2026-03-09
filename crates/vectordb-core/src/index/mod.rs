@@ -54,4 +54,12 @@ pub trait VectorIndex: Send + Sync {
 
     /// Index configuration (dimensions, metric).
     fn config(&self) -> &IndexConfig;
+
+    /// Iterate over all (id, vector) pairs currently in the index.
+    /// Used during WAL compaction to snapshot live state.
+    fn iter_vectors(&self) -> Box<dyn Iterator<Item = (u64, Vec<f32>)> + '_>;
+
+    /// Rebuild internal graph/structures from current vectors.
+    /// Default is a no-op; HNSW overrides this to rebuild the graph.
+    fn flush(&mut self) {}
 }

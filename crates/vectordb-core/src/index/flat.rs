@@ -138,6 +138,10 @@ impl VectorIndex for FlatIndex {
     fn config(&self) -> &IndexConfig {
         &self.config
     }
+
+    fn iter_vectors(&self) -> Box<dyn Iterator<Item = (u64, Vec<f32>)> + '_> {
+        Box::new(self.vectors.iter().map(|(&id, v)| (id, v.clone())))
+    }
 }
 
 #[cfg(test)]

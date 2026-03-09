@@ -22,4 +22,13 @@ pub enum VectorDbError {
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("collection already exists: {0}")]
+    CollectionAlreadyExists(String),
+
+    #[error("collection not found: {0}")]
+    CollectionNotFound(String),
+
+    #[error("WAL corruption at entry {entry}: {reason}")]
+    WalCorruption { entry: usize, reason: String },
 }

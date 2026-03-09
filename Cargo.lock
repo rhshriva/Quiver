@@ -1959,6 +1959,7 @@ dependencies = [
  "rand",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tracing",
  "uuid",
@@ -1969,6 +1970,7 @@ name = "vectordb-python"
 version = "0.1.0"
 dependencies = [
  "pyo3",
+ "serde_json",
  "vectordb-core",
 ]
 
@@ -1981,6 +1983,7 @@ dependencies = [
  "http-body-util",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
  "tower 0.4.13",
