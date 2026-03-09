@@ -14,12 +14,22 @@
 /// - FlatIndex: 100% recall, O(N·D) query, trivial updates
 /// - HnswIndex: ~95–99% recall (tunable), O(log N · ef) query, no single-delete support
 use std::collections::HashMap;
+use std::io::{BufReader, BufWriter};
 
 use crate::{
     distance::Metric,
     error::VectorDbError,
     index::{IndexConfig, SearchResult, VectorIndex},
 };
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct HnswIndexSnapshot {
+    dimensions: usize,
+    metric: Metric,
+    hnsw_config: HnswConfig,
+    flush_threshold: usize,
+    vectors: HashMap<u64, Vec<f32>>,
+}
 
 /// Parameters for building and querying the HNSW graph.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -129,6 +139,47 @@ impl HnswIndex {
 
         let hnsw = builder.build(points, values);
         self.built = Some(BuiltHnsw { hnsw });
+    }
+
+    /// Save the index to a JSON file at `path`.
+    ///
+    /// The HNSW graph itself is not persisted — it is rebuilt from the stored
+    /// vectors when [`load`] calls [`flush`] after deserializing.
+    pub fn save(&self, path: &str) -> Result<(), VectorDbError> {
+        let file = std::fs::File::create(path)?;
+        let writer = BufWriter::new(file);
+        let snapshot = HnswIndexSnapshot {
+            dimensions: self.config.dimensions,
+            metric: self.config.metric,
+            hnsw_config: self.hnsw_config.clone(),
+            flush_threshold: self.flush_threshold,
+            vectors: self.all_vectors.clone(),
+        };
+        serde_json::to_writer(writer, &snapshot)?;
+        Ok(())
+    }
+
+    /// Load an index from a JSON file previously written by [`save`].
+    ///
+    /// The HNSW graph is rebuilt immediately via [`flush`], so the returned
+    /// index is ready for ANN search.
+    pub fn load(path: &str) -> Result<Self, VectorDbError> {
+        let file = std::fs::File::open(path)?;
+        let reader = BufReader::new(file);
+        let snapshot: HnswIndexSnapshot = serde_json::from_reader(reader)?;
+        let mut index = Self {
+            config: IndexConfig {
+                dimensions: snapshot.dimensions,
+                metric: snapshot.metric,
+            },
+            hnsw_config: snapshot.hnsw_config,
+            staging: Vec::new(),
+            all_vectors: snapshot.vectors,
+            flush_threshold: snapshot.flush_threshold,
+            built: None,
+        };
+        index.flush();
+        Ok(index)
     }
 
     /// Set the `ef_search` parameter at runtime (no rebuild needed).
@@ -313,6 +364,21 @@ mod tests {
     }
 
     #[test]
+    fn save_and_load_round_trip() {
+        let idx = make_index();
+        let path = "/tmp/hnsw_index_test.json";
+        idx.save(path).unwrap();
+        let loaded = HnswIndex::load(path).unwrap();
+        assert_eq!(loaded.len(), idx.len());
+        assert_eq!(loaded.config().dimensions, idx.config().dimensions);
+        assert_eq!(loaded.config().metric, idx.config().metric);
+        // Nearest neighbour must still be correct after load+rebuild
+        let orig = idx.search(&[5.0, 0.0, 0.0], 1).unwrap();
+        let from_disk = loaded.search(&[5.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(orig[0].id, from_disk[0].id);
+    }
+
+    #[test]
     fn fallback_before_flush() {
         // Without flush the index falls back to brute force — still correct.
         let cfg = HnswConfig::default();
@@ -321,5 +387,95 @@ mod tests {
         idx.add(2, &[0.0, 1.0]).unwrap();
         let r = idx.search(&[1.0, 0.0], 1).unwrap();
         assert_eq!(r[0].id, 1);
+    }
+
+    #[test]
+    fn cosine_metric() {
+        let cfg = HnswConfig { ef_construction: 100, ef_search: 20, m: 8 };
+        let mut idx = HnswIndex::new(2, Metric::Cosine, cfg);
+        for i in 1u64..=20 {
+            idx.add(i, &[i as f32, 0.0]).unwrap();
+        }
+        idx.flush();
+        // All vectors point in the same direction — cosine distance ≈ 0 for any of them
+        let r = idx.search(&[1.0, 0.0], 1).unwrap();
+        assert!(r[0].distance < 1e-4);
+    }
+
+    #[test]
+    fn dot_product_metric() {
+        let cfg = HnswConfig { ef_construction: 100, ef_search: 20, m: 8 };
+        let mut idx = HnswIndex::new(2, Metric::DotProduct, cfg);
+        for i in 1u64..=20 {
+            idx.add(i, &[i as f32, 0.0]).unwrap();
+        }
+        idx.flush();
+        // Largest dot product with [1,0] → id=20 (vector [20,0], distance = -20)
+        let r = idx.search(&[1.0, 0.0], 1).unwrap();
+        assert_eq!(r[0].id, 20);
+    }
+
+    #[test]
+    fn empty_index_search_returns_empty() {
+        let idx = HnswIndex::new(3, Metric::L2, HnswConfig::default());
+        let r = idx.search(&[1.0, 0.0, 0.0], 5).unwrap();
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn k_zero_returns_empty() {
+        let idx = make_index();
+        let r = idx.search(&[1.0, 0.0, 0.0], 0).unwrap();
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn auto_flush_triggers_at_threshold() {
+        let cfg = HnswConfig::default();
+        let mut idx = HnswIndex::new(1, Metric::L2, cfg).with_flush_threshold(5);
+        for i in 0..5u64 {
+            idx.add(i, &[i as f32]).unwrap();
+        }
+        // After 5 inserts the graph should be built automatically
+        assert_eq!(idx.len(), 5);
+        let r = idx.search(&[2.0], 1).unwrap();
+        assert_eq!(r[0].id, 2);
+    }
+
+    #[test]
+    fn delete_then_flush_restores_search() {
+        let mut idx = make_index(); // 20 vectors, already flushed
+        assert!(idx.delete(10));
+        idx.flush();
+        let r = idx.search(&[10.0, 0.0, 0.0], 1).unwrap();
+        assert_ne!(r[0].id, 10); // deleted vector must not appear
+    }
+
+    #[test]
+    fn add_batch_then_explicit_flush() {
+        let cfg = HnswConfig { ef_construction: 100, ef_search: 20, m: 8 };
+        let mut idx = HnswIndex::new(1, Metric::L2, cfg);
+        let entries: Vec<(u64, Vec<f32>)> = (0..50u64).map(|i| (i, vec![i as f32])).collect();
+        idx.add_batch(&entries).unwrap();
+        idx.flush();
+        assert_eq!(idx.len(), 50);
+        let r = idx.search(&[25.0], 1).unwrap();
+        assert_eq!(r[0].id, 25);
+    }
+
+    #[test]
+    fn save_with_staging_persists_all_vectors() {
+        // Insert fewer than flush_threshold so staging buffer is non-empty at save time.
+        let cfg = HnswConfig::default();
+        let mut idx = HnswIndex::new(1, Metric::L2, cfg).with_flush_threshold(1000);
+        for i in 0..10u64 {
+            idx.add(i, &[i as f32]).unwrap();
+        }
+        let path = "/tmp/hnsw_staging_test.json";
+        idx.save(path).unwrap();
+        let loaded = HnswIndex::load(path).unwrap();
+        assert_eq!(loaded.len(), 10);
+        let r = loaded.search(&[5.0], 1).unwrap();
+        assert_eq!(r[0].id, 5);
     }
 }
