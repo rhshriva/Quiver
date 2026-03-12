@@ -5,7 +5,7 @@ edition.workspace = true
 description = "Python bindings for Quiver"
 
 [lib]
-name = "quiver"
+name = "quiver_vector_db"
 crate-type = ["cdylib"]
 
 [dependencies]

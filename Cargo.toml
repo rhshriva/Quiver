@@ -40,6 +40,9 @@ tempfile = "3"
 # Binary serialization for index snapshots and WAL
 bincode = "1"
 
+# Half-precision floating point (FP16) for quantized indexes
+half = { version = "2", features = ["serde"] }
+
 # LRU cache for IndexRegistry
 lru = "0.12"
 

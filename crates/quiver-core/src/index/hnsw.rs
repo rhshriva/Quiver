@@ -147,7 +147,7 @@ impl HnswIndex {
     ///
     /// The HNSW graph itself is not persisted — it is rebuilt from the stored
     /// vectors when [`load`] calls [`flush`] after deserializing.
-    pub fn save(&self, path: &str) -> Result<(), VectorDbError> {
+    pub fn save(&self, path: impl AsRef<std::path::Path>) -> Result<(), VectorDbError> {
         let file = std::fs::File::create(path)?;
         let mut writer = BufWriter::new(file);
         let snapshot = HnswIndexSnapshot {
@@ -166,7 +166,7 @@ impl HnswIndex {
     ///
     /// The HNSW graph is rebuilt immediately via [`flush`], so the returned
     /// index is ready for ANN search.
-    pub fn load(path: &str) -> Result<Self, VectorDbError> {
+    pub fn load(path: impl AsRef<std::path::Path>) -> Result<Self, VectorDbError> {
         let file = std::fs::File::open(path)?;
         let reader = BufReader::new(file);
         let snapshot: HnswIndexSnapshot = bincode::deserialize_from(reader)
