@@ -20,6 +20,12 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
+[project.optional-dependencies]
+test = ["pytest", "numpy"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 [tool.maturin]
 manifest-path = "crates/quiver-python/Cargo.toml"
 module-name = "quiver_vector_db"
