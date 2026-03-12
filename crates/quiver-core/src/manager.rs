@@ -111,6 +111,7 @@ mod tests {
             promotion_hnsw_config: None,
             embedding_model: None,
             ivf_config: None,
+            ivf_pq_config: None,
             faiss_factory: None,
         }
     }

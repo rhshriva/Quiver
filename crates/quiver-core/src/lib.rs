@@ -14,10 +14,14 @@ pub use error::VectorDbError;
 pub use index::{IndexConfig, SearchResult, VectorIndex};
 pub use index::{flat::FlatIndex, hnsw::{HnswConfig, HnswIndex}};
 pub use index::quantized_flat::QuantizedFlatIndex;
+pub use index::quantized_fp16::Fp16FlatIndex;
+pub use index::pq::{PqCodebook, PqCode, PqConfig};
 pub use index::ivf::{IvfConfig, IvfIndex};
+pub use index::ivf_pq::{IvfPqConfig, IvfPqIndex};
 pub use index::mmap_flat::MmapFlatIndex;
+pub use index::sparse::{SparseIndex, SparseVector, SparseSearchResult};
 
-pub use collection::{Collection, CollectionMeta, CollectionSearchResult, IndexType};
+pub use collection::{Collection, CollectionMeta, CollectionSearchResult, HybridSearchResult, IndexType};
 pub use manager::CollectionManager;
 pub use registry::IndexRegistry;
 pub use payload::{FieldFilter, FieldOp, FilterCondition, Payload, matches_filter};

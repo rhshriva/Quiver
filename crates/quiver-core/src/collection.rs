@@ -13,8 +13,11 @@ use crate::{
         flat::FlatIndex,
         hnsw::{HnswConfig, HnswIndex},
         ivf::{IvfConfig, IvfIndex},
+        ivf_pq::{IvfPqConfig, IvfPqIndex},
         mmap_flat::MmapFlatIndex,
         quantized_flat::QuantizedFlatIndex,
+        quantized_fp16::Fp16FlatIndex,
+        sparse::{SparseIndex, SparseVector},
         VectorIndex,
     },
     payload::{FilterCondition, matches_filter},
@@ -38,6 +41,12 @@ pub enum IndexType {
     /// Inverted file index (k-means + posting lists).
     /// Sub-linear approximate search; configure via [`IvfConfig`].
     Ivf,
+    /// IVF with product quantization for dramatic memory reduction.
+    /// Sub-linear search with ~96× compression for high-dimensional vectors.
+    IvfPq,
+    /// FP16 scalar-quantized brute-force index.
+    /// ~2× lower memory than `Flat` with < 0.1% recall loss.
+    Fp16Flat,
     /// Memory-mapped flat index — vectors live on disk, accessed via mmap.
     /// Keeps RAM usage near zero for large collections.
     MmapFlat,
@@ -73,6 +82,9 @@ pub struct CollectionMeta {
     /// IVF configuration used when `index_type == Ivf`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ivf_config: Option<IvfConfig>,
+    /// IVF-PQ configuration used when `index_type == IvfPq`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ivf_pq_config: Option<IvfPqConfig>,
     /// FAISS factory string used when `index_type == Faiss`.
     /// Defaults to `"Flat"` (exact brute-force, SIMD-accelerated).
     /// Examples: `"IVF1024,Flat"`, `"HNSW32"`, `"IVF256,PQ64"`.
@@ -94,11 +106,27 @@ pub struct CollectionSearchResult {
     pub payload: Option<serde_json::Value>,
 }
 
+/// An enriched hybrid search result that includes both dense and sparse scores.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HybridSearchResult {
+    pub id: u64,
+    /// Fused score (higher = more similar).
+    pub score: f32,
+    /// Raw dense distance (lower = closer).
+    pub dense_distance: f32,
+    /// Raw sparse dot-product score (higher = more similar).
+    pub sparse_score: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload: Option<serde_json::Value>,
+}
+
 /// A named collection: vector index + payload store + WAL.
 pub struct Collection {
     meta: CollectionMeta,
     index: Box<dyn VectorIndex>,
     payloads: HashMap<u64, serde_json::Value>,
+    /// Sparse inverted index for hybrid search (lazily created on first sparse upsert).
+    sparse_index: SparseIndex,
     wal: Wal,
     dir: PathBuf,
     /// Optional embedder for `upsert_text` / `search_text`.
@@ -127,6 +155,7 @@ impl Collection {
             meta,
             index,
             payloads: HashMap::new(),
+            sparse_index: SparseIndex::new(),
             wal,
             dir,
             embedder: None,
@@ -150,8 +179,19 @@ impl Collection {
         let mut index = build_index(&meta, &dir);
         let mut payloads: HashMap<u64, serde_json::Value> = HashMap::new();
 
+        // Load persisted sparse index if it exists; otherwise start empty.
+        let sparse_path = dir.join("sparse.bin");
+        let mut sparse_index = if sparse_path.is_file() {
+            SparseIndex::load(&sparse_path).unwrap_or_else(|e| {
+                tracing::warn!("failed to load sparse index: {e}; starting fresh");
+                SparseIndex::new()
+            })
+        } else {
+            SparseIndex::new()
+        };
+
         Wal::replay(dir.join("wal.log"), |entry| match entry {
-            WalEntry::Add { id, vector, payload_bytes } => {
+            WalEntry::Add { id, vector, payload_bytes, sparse_bytes } => {
                 // Idempotent upsert on replay
                 index.delete(id);
                 let _ = index.add(id, &vector);
@@ -163,10 +203,17 @@ impl Collection {
                     }
                     None => { payloads.remove(&id); }
                 }
+                // Replay sparse data if present
+                if let Some(sb) = sparse_bytes {
+                    if let Ok(sv) = bincode::deserialize::<SparseVector>(&sb) {
+                        sparse_index.upsert(id, sv);
+                    }
+                }
             }
             WalEntry::Delete { id } => {
                 index.delete(id);
                 payloads.remove(&id);
+                sparse_index.delete(id);
             }
         })?;
 
@@ -180,6 +227,7 @@ impl Collection {
             meta,
             index,
             payloads,
+            sparse_index,
             wal,
             dir,
             embedder: None,
@@ -198,6 +246,7 @@ impl Collection {
             vector: vector.clone(),
             payload_bytes: payload.as_ref()
                 .map(|p| serde_json::to_vec(p).unwrap_or_default()),
+            sparse_bytes: None,
         };
         self.wal.append(&entry)?;
 
@@ -214,10 +263,172 @@ impl Collection {
         Ok(())
     }
 
+    /// Upsert a vector with an optional sparse vector for hybrid search.
+    ///
+    /// The dense vector is stored in the main index. The sparse vector (if
+    /// provided) is stored in a separate inverted index for hybrid search.
+    pub fn upsert_hybrid(
+        &mut self,
+        id: u64,
+        vector: Vec<f32>,
+        sparse_vector: Option<SparseVector>,
+        payload: Option<serde_json::Value>,
+    ) -> Result<(), VectorDbError> {
+        let sparse_bytes = sparse_vector.as_ref().map(|sv| {
+            bincode::serialize(sv).unwrap_or_default()
+        });
+        let entry = WalEntry::Add {
+            id,
+            vector: vector.clone(),
+            payload_bytes: payload.as_ref()
+                .map(|p| serde_json::to_vec(p).unwrap_or_default()),
+            sparse_bytes,
+        };
+        self.wal.append(&entry)?;
+
+        // Update dense index
+        self.index.delete(id);
+        self.index.add(id, &vector)?;
+
+        // Update sparse index
+        if let Some(sv) = sparse_vector {
+            self.sparse_index.upsert(id, sv);
+        }
+
+        // Update payload
+        match payload {
+            Some(p) => { self.payloads.insert(id, p); }
+            None => { self.payloads.remove(&id); }
+        }
+
+        self.maybe_compact()?;
+        self.maybe_promote()?;
+        Ok(())
+    }
+
+    /// Hybrid search: weighted fusion of dense ANN + sparse keyword search.
+    ///
+    /// Returns top-k results ranked by:
+    /// `score = dense_weight * (1 - norm_dense_dist) + sparse_weight * norm_sparse_score`
+    ///
+    /// where `norm_dense_dist` and `norm_sparse_score` are min-max normalized
+    /// to [0, 1] across the candidate set.
+    ///
+    /// # Arguments
+    /// - `dense_query`: dense query vector for the ANN index
+    /// - `sparse_query`: sparse query vector for the inverted index
+    /// - `k`: number of results to return
+    /// - `dense_weight`: weight for the dense similarity score (default: 0.7)
+    /// - `sparse_weight`: weight for the sparse similarity score (default: 0.3)
+    /// - `filter`: optional payload filter applied post-search
+    pub fn search_hybrid(
+        &self,
+        dense_query: &[f32],
+        sparse_query: &SparseVector,
+        k: usize,
+        dense_weight: f32,
+        sparse_weight: f32,
+        filter: Option<&FilterCondition>,
+    ) -> Result<Vec<HybridSearchResult>, VectorDbError> {
+        if k == 0 {
+            return Ok(vec![]);
+        }
+
+        // Overscan for dense and sparse to get enough candidates.
+        let overscan = k.saturating_mul(FILTER_OVERSCAN).max(k);
+
+        // Dense ANN search.
+        let dense_results = self.index.search(dense_query, overscan)?;
+
+        // Sparse search.
+        let sparse_results = self.sparse_index.search(sparse_query, overscan);
+
+        // Collect all candidate IDs and their raw scores.
+        let mut dense_scores: HashMap<u64, f32> = HashMap::new();
+        let mut sparse_scores: HashMap<u64, f32> = HashMap::new();
+
+        for r in &dense_results {
+            dense_scores.insert(r.id, r.distance);
+        }
+        for r in &sparse_results {
+            sparse_scores.insert(r.id, r.score);
+        }
+
+        // Union of all candidate IDs.
+        let mut all_ids: Vec<u64> = dense_scores.keys()
+            .chain(sparse_scores.keys())
+            .copied()
+            .collect::<std::collections::HashSet<u64>>()
+            .into_iter()
+            .collect();
+
+        // Min-max normalization for dense distances (lower = better → invert).
+        let (dense_min, dense_max) = if dense_scores.is_empty() {
+            (0.0, 1.0)
+        } else {
+            let min = dense_scores.values().cloned().fold(f32::MAX, f32::min);
+            let max = dense_scores.values().cloned().fold(f32::MIN, f32::max);
+            (min, max)
+        };
+        let dense_range = (dense_max - dense_min).max(1e-9);
+
+        // Min-max normalization for sparse scores (higher = better).
+        let (sparse_min, sparse_max) = if sparse_scores.is_empty() {
+            (0.0, 1.0)
+        } else {
+            let min = sparse_scores.values().cloned().fold(f32::MAX, f32::min);
+            let max = sparse_scores.values().cloned().fold(f32::MIN, f32::max);
+            (min, max)
+        };
+        let sparse_range = (sparse_max - sparse_min).max(1e-9);
+
+        // Compute fused scores.
+        let mut results: Vec<HybridSearchResult> = all_ids.drain(..).filter_map(|id| {
+            // Apply filter if present.
+            if let Some(f) = filter {
+                let payload_ref = self.payloads.get(&id).unwrap_or(&serde_json::Value::Null);
+                if !matches_filter(payload_ref, f) {
+                    return None;
+                }
+            }
+
+            let raw_dense = *dense_scores.get(&id).unwrap_or(&dense_max);
+            let raw_sparse = *sparse_scores.get(&id).unwrap_or(&0.0);
+
+            // Normalize: dense distance → similarity (1 = most similar, 0 = least).
+            let norm_dense = 1.0 - (raw_dense - dense_min) / dense_range;
+            // Normalize: sparse score → [0, 1].
+            let norm_sparse = (raw_sparse - sparse_min) / sparse_range;
+
+            let fused_score = dense_weight * norm_dense + sparse_weight * norm_sparse;
+
+            Some(HybridSearchResult {
+                id,
+                score: fused_score,
+                dense_distance: raw_dense,
+                sparse_score: raw_sparse,
+                payload: self.payloads.get(&id).cloned(),
+            })
+        }).collect();
+
+        // Sort by fused score descending (higher = better).
+        results.sort_unstable_by(|a, b| {
+            b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        results.truncate(k);
+        Ok(results)
+    }
+
+    /// Number of sparse vectors stored.
+    pub fn sparse_count(&self) -> usize {
+        self.sparse_index.len()
+    }
+
     /// Delete a vector by id. Returns true if found and removed.
     pub fn delete(&mut self, id: u64) -> Result<bool, VectorDbError> {
         self.wal.append(&WalEntry::Delete { id })?;
         let found = self.index.delete(id);
+        self.sparse_index.delete(id);
         self.payloads.remove(&id);
         self.maybe_compact()?;
         Ok(found)
@@ -348,6 +559,8 @@ impl Collection {
                 vector,
                 payload_bytes: self.payloads.get(&id)
                     .map(|p| serde_json::to_vec(p).unwrap_or_default()),
+                sparse_bytes: self.sparse_index.get(id)
+                    .map(|sv| bincode::serialize(sv).unwrap_or_default()),
             })
             .collect();
         let count = live.len();
@@ -357,6 +570,10 @@ impl Collection {
         self.wal.reset_entry_count(count);
         // Persist HNSW graph so the next load skips the rebuild
         self.index.save_graph(&self.dir.join("hnsw.graph"))?;
+        // Persist sparse index
+        if !self.sparse_index.is_empty() {
+            self.sparse_index.save(self.dir.join("sparse.bin"))?;
+        }
         Ok(())
     }
 
@@ -413,6 +630,7 @@ fn build_index(meta: &CollectionMeta, dir: &Path) -> Box<dyn VectorIndex> {
     match meta.index_type {
         IndexType::Flat => Box::new(FlatIndex::new(meta.dimensions, meta.metric)),
         IndexType::QuantizedFlat => Box::new(QuantizedFlatIndex::new(meta.dimensions, meta.metric)),
+        IndexType::Fp16Flat => Box::new(Fp16FlatIndex::new(meta.dimensions, meta.metric)),
         IndexType::Hnsw => {
             let cfg = meta.hnsw_config.clone().unwrap_or_default();
             Box::new(HnswIndex::new(meta.dimensions, meta.metric, cfg))
@@ -420,6 +638,10 @@ fn build_index(meta: &CollectionMeta, dir: &Path) -> Box<dyn VectorIndex> {
         IndexType::Ivf => {
             let cfg = meta.ivf_config.clone().unwrap_or_default();
             Box::new(IvfIndex::new(meta.dimensions, meta.metric, cfg))
+        }
+        IndexType::IvfPq => {
+            let cfg = meta.ivf_pq_config.clone().unwrap_or_default();
+            Box::new(IvfPqIndex::new(meta.dimensions, meta.metric, cfg))
         }
         IndexType::MmapFlat => {
             let data_path = dir.join("vectors.mmap");
@@ -467,6 +689,7 @@ mod tests {
             promotion_hnsw_config: None,
             embedding_model: None,
             ivf_config: None,
+            ivf_pq_config: None,
             faiss_factory: None,
         }
     }
@@ -636,5 +859,174 @@ mod tests {
         let mut entries = Vec::new();
         crate::wal::Wal::replay(path.join("wal.log"), |e| entries.push(e)).unwrap();
         assert_eq!(entries.len(), 10);
+    }
+
+    // ── Hybrid search tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn collection_hybrid_upsert_and_search() {
+        use crate::index::sparse::SparseVector;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("col");
+        let meta = make_meta("hybrid", IndexType::Flat);
+        let mut col = Collection::create(&path, meta).unwrap();
+
+        // Vector 1: strong dense match, weak sparse match
+        col.upsert_hybrid(
+            1,
+            vec![1.0, 0.0, 0.0],
+            Some(SparseVector::new(vec![0, 1], vec![0.1, 0.1])),
+            None,
+        ).unwrap();
+
+        // Vector 2: moderate dense match, strong sparse match
+        col.upsert_hybrid(
+            2,
+            vec![0.5, 0.5, 0.0],
+            Some(SparseVector::new(vec![0, 1], vec![1.0, 1.0])),
+            None,
+        ).unwrap();
+
+        // Vector 3: weak dense match, no sparse match
+        col.upsert_hybrid(
+            3,
+            vec![0.0, 0.0, 1.0],
+            Some(SparseVector::new(vec![5], vec![0.1])),
+            None,
+        ).unwrap();
+
+        // Dense-only query would prefer id=1.
+        // Sparse query [0:1.0, 1:1.0] strongly prefers id=2.
+        // With balanced weights, id=2 should rank higher.
+        let results = col.search_hybrid(
+            &[1.0, 0.0, 0.0],
+            &SparseVector::new(vec![0, 1], vec![1.0, 1.0]),
+            3,
+            0.5,
+            0.5,
+            None,
+        ).unwrap();
+
+        assert_eq!(results.len(), 3);
+        // id=2 should be top due to strong sparse match
+        assert_eq!(results[0].id, 2, "expected id=2 as top hybrid result");
+        assert_eq!(col.sparse_count(), 3);
+    }
+
+    #[test]
+    fn collection_hybrid_search_with_filter() {
+        use crate::index::sparse::SparseVector;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("col");
+        let meta = make_meta("hybrid", IndexType::Flat);
+        let mut col = Collection::create(&path, meta).unwrap();
+
+        col.upsert_hybrid(
+            1, vec![1.0, 0.0, 0.0],
+            Some(SparseVector::new(vec![0], vec![1.0])),
+            Some(serde_json::json!({"category": "tech"})),
+        ).unwrap();
+        col.upsert_hybrid(
+            2, vec![0.9, 0.1, 0.0],
+            Some(SparseVector::new(vec![0], vec![0.5])),
+            Some(serde_json::json!({"category": "news"})),
+        ).unwrap();
+
+        let filter: FilterCondition = serde_json::from_str(r#"{"category": {"$eq": "tech"}}"#).unwrap();
+        let results = col.search_hybrid(
+            &[1.0, 0.0, 0.0],
+            &SparseVector::new(vec![0], vec![1.0]),
+            10,
+            0.5,
+            0.5,
+            Some(&filter),
+        ).unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, 1);
+    }
+
+    #[test]
+    fn collection_hybrid_persists_across_restart() {
+        use crate::index::sparse::SparseVector;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("col");
+        let meta = make_meta("hybrid", IndexType::Flat);
+
+        {
+            let mut col = Collection::create(&path, meta).unwrap();
+            col.upsert_hybrid(
+                1, vec![1.0, 0.0, 0.0],
+                Some(SparseVector::new(vec![0, 1], vec![1.0, 0.5])),
+                Some(serde_json::json!({"tag": "a"})),
+            ).unwrap();
+            col.upsert_hybrid(
+                2, vec![0.0, 1.0, 0.0],
+                Some(SparseVector::new(vec![1, 2], vec![0.8, 0.3])),
+                None,
+            ).unwrap();
+        }
+
+        // Reload and verify sparse data survives WAL replay
+        let col = Collection::load(&path).unwrap();
+        assert_eq!(col.count(), 2);
+        assert_eq!(col.sparse_count(), 2);
+
+        let results = col.search_hybrid(
+            &[1.0, 0.0, 0.0],
+            &SparseVector::new(vec![0], vec![1.0]),
+            1,
+            0.5,
+            0.5,
+            None,
+        ).unwrap();
+        assert_eq!(results[0].id, 1);
+    }
+
+    #[test]
+    fn collection_hybrid_delete_removes_sparse() {
+        use crate::index::sparse::SparseVector;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("col");
+        let meta = make_meta("hybrid", IndexType::Flat);
+        let mut col = Collection::create(&path, meta).unwrap();
+
+        col.upsert_hybrid(1, vec![1.0, 0.0, 0.0], Some(SparseVector::new(vec![0], vec![1.0])), None).unwrap();
+        col.upsert_hybrid(2, vec![0.0, 1.0, 0.0], Some(SparseVector::new(vec![1], vec![1.0])), None).unwrap();
+        assert_eq!(col.sparse_count(), 2);
+
+        col.delete(1).unwrap();
+        assert_eq!(col.sparse_count(), 1);
+        assert_eq!(col.count(), 1);
+    }
+
+    #[test]
+    fn collection_dense_only_upsert_works_with_hybrid_search() {
+        use crate::index::sparse::SparseVector;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("col");
+        let meta = make_meta("dense_hybrid", IndexType::Flat);
+        let mut col = Collection::create(&path, meta).unwrap();
+
+        // Regular dense-only upsert
+        col.upsert(1, vec![1.0, 0.0, 0.0], None).unwrap();
+        col.upsert(2, vec![0.0, 1.0, 0.0], None).unwrap();
+
+        // Hybrid search with empty sparse should still work (all sparse scores = 0).
+        let results = col.search_hybrid(
+            &[1.0, 0.0, 0.0],
+            &SparseVector::new(vec![0], vec![1.0]),
+            2,
+            1.0,
+            0.0,
+            None,
+        ).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].id, 1); // closest dense
     }
 }
