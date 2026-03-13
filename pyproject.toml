@@ -3,18 +3,32 @@ requires = ["maturin>=1.7,<2"]
 build-backend = "maturin"
 
 [project]
-name = "quiver"
+name = "quiver-vector-db"
 version = "0.1.0"
 description = "Fast embedded vector database with Python bindings"
+readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "MIT" }
+keywords = ["vector", "database", "embeddings", "similarity-search", "ann"]
+authors = [{ name = "Quiver contributors" }]
+urls = { Homepage = "https://github.com/rhshriva/Quiver", Repository = "https://github.com/rhshriva/Quiver" }
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: 3",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
+
+[project.optional-dependencies]
+test = ["pytest", "numpy"]
+benchmark = ["pytest", "numpy", "hnswlib", "faiss-cpu", "chromadb", "usearch"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 [tool.maturin]
 manifest-path = "crates/quiver-python/Cargo.toml"
-module-name = "quiver"
+module-name = "quiver_vector_db"
 features = ["pyo3/extension-module"]
+python-source = "."

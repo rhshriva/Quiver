@@ -1,8 +1,12 @@
 pub mod flat;
 pub mod hnsw;
 pub mod quantized_flat;
+pub mod quantized_fp16;
+pub mod pq;
 pub mod ivf;
+pub mod ivf_pq;
 pub mod mmap_flat;
+pub mod sparse;
 #[cfg(feature = "faiss")]
 pub mod faiss;
 

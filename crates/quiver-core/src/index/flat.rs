@@ -38,7 +38,7 @@ impl FlatIndex {
     }
 
     /// Save the index to a binary file at `path` (bincode format).
-    pub fn save(&self, path: &str) -> Result<(), VectorDbError> {
+    pub fn save(&self, path: impl AsRef<std::path::Path>) -> Result<(), VectorDbError> {
         let file = std::fs::File::create(path)?;
         let mut writer = BufWriter::new(file);
         let snapshot = FlatIndexSnapshot {
@@ -52,7 +52,7 @@ impl FlatIndex {
     }
 
     /// Load an index from a binary file previously written by [`save`].
-    pub fn load(path: &str) -> Result<Self, VectorDbError> {
+    pub fn load(path: impl AsRef<std::path::Path>) -> Result<Self, VectorDbError> {
         let file = std::fs::File::open(path)?;
         let reader = BufReader::new(file);
         let snapshot: FlatIndexSnapshot = bincode::deserialize_from(reader)
