@@ -1,6 +1,6 @@
 """Type stubs for quiver_vector_db — embedded vector database with Rust core."""
 
-from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Protocol, Sequence, Tuple, Union
 
 # ── Standalone Index Classes ───────────────────────────────────────────────
 
@@ -489,3 +489,176 @@ class Client:
         ...
 
     def __repr__(self) -> str: ...
+
+
+# ── Embedding Function Protocol ───────────────────────────────────────
+
+class EmbeddingFunction(Protocol):
+    """Protocol that any embedding provider must satisfy.
+
+    Implement ``__call__`` to embed a batch of texts, and optionally
+    ``dimensions`` to report the output dimensionality.
+    """
+
+    def __call__(self, texts: List[str]) -> List[List[float]]: ...
+
+    @property
+    def dimensions(self) -> Optional[int]: ...
+
+
+class SentenceTransformerEmbedding:
+    """Local embedding via sentence-transformers.
+
+    Requires: ``pip install quiver-vector-db[sentence-transformers]``
+    """
+
+    def __init__(
+        self,
+        model_name: str = "all-MiniLM-L6-v2",
+        device: Optional[str] = None,
+    ) -> None: ...
+
+    def __call__(self, texts: List[str]) -> List[List[float]]: ...
+
+    @property
+    def dimensions(self) -> int: ...
+
+
+class OpenAIEmbedding:
+    """OpenAI embedding API wrapper.
+
+    Requires: ``pip install quiver-vector-db[openai]``
+    """
+
+    def __init__(
+        self,
+        model: str = "text-embedding-3-small",
+        api_key: Optional[str] = None,
+        dimensions: Optional[int] = None,
+    ) -> None: ...
+
+    def __call__(self, texts: List[str]) -> List[List[float]]: ...
+
+    @property
+    def dimensions(self) -> Optional[int]: ...
+
+
+# ── BM25 ──────────────────────────────────────────────────────────────
+
+class BM25:
+    """Okapi BM25 tokenizer and sparse vector generator.
+
+    Produces sparse vectors compatible with ``Collection.upsert_hybrid()``.
+    """
+
+    doc_count: int
+    """Total number of indexed documents."""
+    vocab_size: int
+    """Number of unique terms in the vocabulary."""
+    avg_dl: float
+    """Average document length (in tokens)."""
+
+    def __init__(self, k1: float = 1.5, b: float = 0.75) -> None: ...
+
+    def index_document(self, doc_id: int, text: str) -> Dict[int, float]:
+        """Tokenize and index a document. Returns BM25 sparse vector."""
+        ...
+
+    def encode_query(self, text: str) -> Dict[int, float]:
+        """Encode a query into an IDF-weighted sparse vector."""
+        ...
+
+    def remove_document(self, doc_id: int) -> None:
+        """Remove a document's contribution to global stats."""
+        ...
+
+    def save(self, path: str) -> None:
+        """Serialize BM25 state to a JSON file."""
+        ...
+
+    @classmethod
+    def load(cls, path: str) -> "BM25":
+        """Load BM25 state from a JSON file."""
+        ...
+
+
+# ── TextCollection ────────────────────────────────────────────────────
+
+class TextCollection:
+    """Document-oriented collection with automatic embedding + BM25.
+
+    Wraps a Rust ``Collection`` and provides text-in / text-out methods.
+
+    Example::
+
+        text_col = TextCollection(col, SentenceTransformerEmbedding())
+        text_col.add(ids=[1, 2], documents=["Hello", "World"])
+        hits = text_col.query("greeting", k=5)
+    """
+
+    count: int
+    """Number of documents in the collection."""
+    name: str
+    """Collection name."""
+
+    def __init__(
+        self,
+        collection: Collection,
+        embedding_function: EmbeddingFunction,
+        enable_bm25: bool = True,
+        bm25_k1: float = 1.5,
+        bm25_b: float = 0.75,
+    ) -> None:
+        """
+        Args:
+            collection: A Rust ``Collection`` from ``Client.create_collection()``.
+            embedding_function: Any callable satisfying ``EmbeddingFunction``.
+            enable_bm25: Enable BM25 full-text indexing (default True).
+            bm25_k1: BM25 k1 parameter (term frequency saturation).
+            bm25_b: BM25 b parameter (document length normalization).
+        """
+        ...
+
+    def add(
+        self,
+        ids: Sequence[int],
+        documents: Sequence[str],
+        payloads: Optional[Sequence[Optional[Dict[str, Any]]]] = None,
+    ) -> None:
+        """Add documents by text. Handles embedding and BM25 indexing.
+
+        Args:
+            ids: Unique integer IDs.
+            documents: Text strings to embed and index.
+            payloads: Optional metadata dicts (one per document).
+        """
+        ...
+
+    def query(
+        self,
+        query_text: str,
+        k: int = 10,
+        mode: Literal["hybrid", "semantic", "keyword"] = "hybrid",
+        dense_weight: float = 0.7,
+        sparse_weight: float = 0.3,
+        filter: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Search by natural language query.
+
+        Args:
+            query_text: Natural language query string.
+            k: Number of results to return.
+            mode: ``"hybrid"`` (default), ``"semantic"``, or ``"keyword"``.
+            dense_weight: Weight for dense similarity (hybrid mode).
+            sparse_weight: Weight for keyword similarity (hybrid mode).
+            filter: Optional payload filter dict.
+
+        Returns:
+            List of result dicts with ``id``, ``document``, ``payload``,
+            and either ``distance`` (semantic) or ``score`` (hybrid/keyword).
+        """
+        ...
+
+    def delete(self, ids: Sequence[int]) -> None:
+        """Delete documents by ID."""
+        ...
