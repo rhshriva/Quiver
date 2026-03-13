@@ -3,6 +3,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
+use std::collections::HashMap;
 use quiver_core::{
     collection::{CollectionMeta, IndexType},
     distance::Metric,
@@ -10,6 +11,12 @@ use quiver_core::{
     index::{
         flat::FlatIndex,
         hnsw::{HnswConfig, HnswIndex},
+        ivf::{IvfConfig, IvfIndex},
+        ivf_pq::{IvfPqConfig, IvfPqIndex},
+        mmap_flat::MmapFlatIndex,
+        quantized_flat::QuantizedFlatIndex,
+        quantized_fp16::Fp16FlatIndex,
+        sparse::SparseVector,
         VectorIndex,
     },
     manager::CollectionManager,
@@ -136,6 +143,29 @@ fn py_to_filter(val: &Bound<'_, PyAny>) -> PyResult<FilterCondition> {
         .map_err(|e| PyValueError::new_err(format!("invalid filter: {e}")))
 }
 
+/// Convert a Python dict `{int: float, ...}` to a `SparseVector`.
+fn py_dict_to_sparse(dict: &Bound<'_, PyDict>) -> PyResult<SparseVector> {
+    let mut map: HashMap<u32, f32> = HashMap::new();
+    for (k, v) in dict.iter() {
+        let idx = k.extract::<u32>()?;
+        let val = v.extract::<f32>()?;
+        map.insert(idx, val);
+    }
+    Ok(SparseVector::from_map(&map))
+}
+
+/// Exact brute-force vector index. 100% recall, O(N*D) per query.
+///
+/// Best for small datasets (<100K vectors) or when exact results are required.
+///
+/// Args:
+///     dimensions: Number of dimensions per vector.
+///     metric: Distance metric - "l2", "cosine", or "dot_product".
+///
+/// Example:
+///     >>> idx = FlatIndex(dimensions=384, metric="cosine")
+///     >>> idx.add(id=1, vector=[0.1, 0.2, ...])
+///     >>> results = idx.search(query=[0.1, 0.2, ...], k=10)
 #[pyclass(name = "FlatIndex")]
 struct PyFlatIndex {
     inner: FlatIndex,
@@ -148,6 +178,153 @@ impl PyFlatIndex {
     fn new(dimensions: usize, metric: &str) -> PyResult<Self> {
         let m = parse_metric(metric)?;
         Ok(Self { inner: FlatIndex::new(dimensions, m) })
+    }
+
+    /// Add a single vector with the given ID.
+    #[pyo3(signature = (id, vector))]
+    fn add(&mut self, id: u64, vector: Vec<f32>) -> PyResult<()> {
+        self.inner.add(id, &vector).map_err(vec_err_to_py)
+    }
+
+    /// Add multiple vectors at once. Takes a list of (id, vector) tuples.
+    fn add_batch(&mut self, entries: Vec<(u64, Vec<f32>)>) -> PyResult<()> {
+        self.inner.add_batch(&entries).map_err(vec_err_to_py)
+    }
+
+    /// Search for the k nearest vectors. Returns list of {"id": int, "distance": float}.
+    fn search(&self, py: Python<'_>, query: Vec<f32>, k: usize) -> PyResult<Vec<PyObject>> {
+        let results = py.allow_threads(|| self.inner.search(&query, k)).map_err(vec_err_to_py)?;
+        results.into_iter().map(|r| {
+            let dict = PyDict::new_bound(py);
+            dict.set_item("id", r.id)?;
+            dict.set_item("distance", r.distance)?;
+            Ok(dict.into())
+        }).collect()
+    }
+
+    /// Remove a vector by ID. Returns True if found and removed.
+    fn delete(&mut self, id: u64) -> bool { self.inner.delete(id) }
+    fn __len__(&self) -> usize { self.inner.len() }
+
+    /// Number of dimensions per vector.
+    #[getter]
+    fn dimensions(&self) -> usize { self.inner.config().dimensions }
+
+    /// Distance metric ("l2", "cosine", or "dot_product").
+    #[getter]
+    fn metric(&self) -> &'static str { metric_to_str(self.inner.config().metric) }
+
+    /// Save index to a binary file.
+    fn save(&self, path: &str) -> PyResult<()> { self.inner.save(path).map_err(vec_err_to_py) }
+
+    /// Load a previously saved index from a binary file.
+    #[staticmethod]
+    fn load(path: &str) -> PyResult<Self> {
+        let inner = FlatIndex::load(path).map_err(vec_err_to_py)?;
+        Ok(Self { inner })
+    }
+
+    fn __repr__(&self) -> String {
+        format!("FlatIndex(dimensions={}, metric=\"{}\", len={})",
+            self.inner.config().dimensions, metric_to_str(self.inner.config().metric), self.inner.len())
+    }
+}
+
+/// Graph-based approximate nearest-neighbour index (HNSW). 95-99% recall.
+///
+/// Best general-purpose index for datasets of any size.
+///
+/// Args:
+///     dimensions: Number of dimensions per vector.
+///     metric: Distance metric - "l2", "cosine", or "dot_product".
+///     ef_construction: Build beam width (default 200). Higher = better recall, slower build.
+///     ef_search: Query beam width (default 50). Tunable at runtime.
+///     m: Graph edges per node (default 12). Higher = better recall, more RAM.
+///
+/// Example:
+///     >>> hnsw = HnswIndex(dimensions=384, metric="cosine")
+///     >>> hnsw.add(id=1, vector=[...])
+///     >>> hnsw.flush()  # build graph after bulk inserts
+///     >>> results = hnsw.search(query=[...], k=10)
+#[pyclass(name = "HnswIndex")]
+struct PyHnswIndex {
+    inner: HnswIndex,
+}
+
+#[pymethods]
+impl PyHnswIndex {
+    #[new]
+    #[pyo3(signature = (dimensions, metric = "l2", ef_construction = 200, ef_search = 50, m = 12))]
+    fn new(dimensions: usize, metric: &str, ef_construction: usize, ef_search: usize, m: usize) -> PyResult<Self> {
+        let met = parse_metric(metric)?;
+        let cfg = HnswConfig { ef_construction, ef_search, m };
+        Ok(Self { inner: HnswIndex::new(dimensions, met, cfg) })
+    }
+
+    #[pyo3(signature = (id, vector))]
+    fn add(&mut self, id: u64, vector: Vec<f32>) -> PyResult<()> {
+        self.inner.add(id, &vector).map_err(vec_err_to_py)
+    }
+
+    fn add_batch(&mut self, entries: Vec<(u64, Vec<f32>)>) -> PyResult<()> {
+        self.inner.add_batch(&entries).map_err(vec_err_to_py)
+    }
+
+    fn search(&self, py: Python<'_>, query: Vec<f32>, k: usize) -> PyResult<Vec<PyObject>> {
+        let results = py.allow_threads(|| self.inner.search(&query, k)).map_err(vec_err_to_py)?;
+        results.into_iter().map(|r| {
+            let dict = PyDict::new_bound(py);
+            dict.set_item("id", r.id)?;
+            dict.set_item("distance", r.distance)?;
+            Ok(dict.into())
+        }).collect()
+    }
+
+    fn delete(&mut self, id: u64) -> bool { self.inner.delete(id) }
+
+    /// Build the HNSW graph. Call after bulk inserts for best performance.
+    fn flush(&mut self, py: Python<'_>) { py.allow_threads(|| self.inner.flush()); }
+
+    fn __len__(&self) -> usize { self.inner.len() }
+
+    #[getter]
+    fn dimensions(&self) -> usize { self.inner.config().dimensions }
+
+    #[getter]
+    fn metric(&self) -> &'static str { metric_to_str(self.inner.config().metric) }
+
+    fn save(&self, path: &str) -> PyResult<()> { self.inner.save(path).map_err(vec_err_to_py) }
+
+    #[staticmethod]
+    fn load(path: &str) -> PyResult<Self> {
+        let inner = HnswIndex::load(path).map_err(vec_err_to_py)?;
+        Ok(Self { inner })
+    }
+
+    fn __repr__(&self) -> String {
+        format!("HnswIndex(dimensions={}, metric=\"{}\", len={})",
+            self.inner.config().dimensions, metric_to_str(self.inner.config().metric), self.inner.len())
+    }
+}
+
+// ── QuantizedFlatIndex ────────────────────────────────────────────────────────
+
+/// Int8 quantized brute-force index. ~4x less RAM than FlatIndex with ~99% recall.
+///
+/// Each f32 component is quantized to int8 using min/max scaling.
+/// Same API as FlatIndex.
+#[pyclass(name = "QuantizedFlatIndex")]
+struct PyQuantizedFlatIndex {
+    inner: QuantizedFlatIndex,
+}
+
+#[pymethods]
+impl PyQuantizedFlatIndex {
+    #[new]
+    #[pyo3(signature = (dimensions, metric = "l2"))]
+    fn new(dimensions: usize, metric: &str) -> PyResult<Self> {
+        let m = parse_metric(metric)?;
+        Ok(Self { inner: QuantizedFlatIndex::new(dimensions, m) })
     }
 
     #[pyo3(signature = (id, vector))]
@@ -182,29 +359,103 @@ impl PyFlatIndex {
 
     #[staticmethod]
     fn load(path: &str) -> PyResult<Self> {
-        let inner = FlatIndex::load(path).map_err(vec_err_to_py)?;
+        let inner = QuantizedFlatIndex::load(path).map_err(vec_err_to_py)?;
         Ok(Self { inner })
     }
 
     fn __repr__(&self) -> String {
-        format!("FlatIndex(dimensions={}, metric=\"{}\", len={})",
+        format!("QuantizedFlatIndex(dimensions={}, metric=\"{}\", len={})",
             self.inner.config().dimensions, metric_to_str(self.inner.config().metric), self.inner.len())
     }
 }
 
-#[pyclass(name = "HnswIndex")]
-struct PyHnswIndex {
-    inner: HnswIndex,
+// ── Fp16FlatIndex ────────────────────────────────────────────────────────────
+
+/// Float16 quantized brute-force index. 2x less RAM than FlatIndex with >99.5% recall.
+///
+/// Vectors are stored as half-precision floats and decoded on-the-fly for distance computation.
+/// Same API as FlatIndex.
+#[pyclass(name = "Fp16FlatIndex")]
+struct PyFp16FlatIndex {
+    inner: Fp16FlatIndex,
 }
 
 #[pymethods]
-impl PyHnswIndex {
+impl PyFp16FlatIndex {
     #[new]
-    #[pyo3(signature = (dimensions, metric = "l2", ef_construction = 200, ef_search = 50, m = 12))]
-    fn new(dimensions: usize, metric: &str, ef_construction: usize, ef_search: usize, m: usize) -> PyResult<Self> {
-        let met = parse_metric(metric)?;
-        let cfg = HnswConfig { ef_construction, ef_search, m };
-        Ok(Self { inner: HnswIndex::new(dimensions, met, cfg) })
+    #[pyo3(signature = (dimensions, metric = "l2"))]
+    fn new(dimensions: usize, metric: &str) -> PyResult<Self> {
+        let m = parse_metric(metric)?;
+        Ok(Self { inner: Fp16FlatIndex::new(dimensions, m) })
+    }
+
+    #[pyo3(signature = (id, vector))]
+    fn add(&mut self, id: u64, vector: Vec<f32>) -> PyResult<()> {
+        self.inner.add(id, &vector).map_err(vec_err_to_py)
+    }
+
+    fn add_batch(&mut self, entries: Vec<(u64, Vec<f32>)>) -> PyResult<()> {
+        self.inner.add_batch(&entries).map_err(vec_err_to_py)
+    }
+
+    fn search(&self, py: Python<'_>, query: Vec<f32>, k: usize) -> PyResult<Vec<PyObject>> {
+        let results = py.allow_threads(|| self.inner.search(&query, k)).map_err(vec_err_to_py)?;
+        results.into_iter().map(|r| {
+            let dict = PyDict::new_bound(py);
+            dict.set_item("id", r.id)?;
+            dict.set_item("distance", r.distance)?;
+            Ok(dict.into())
+        }).collect()
+    }
+
+    fn delete(&mut self, id: u64) -> bool { self.inner.delete(id) }
+    fn __len__(&self) -> usize { self.inner.len() }
+
+    #[getter]
+    fn dimensions(&self) -> usize { self.inner.config().dimensions }
+
+    #[getter]
+    fn metric(&self) -> &'static str { metric_to_str(self.inner.config().metric) }
+
+    fn save(&self, path: &str) -> PyResult<()> { self.inner.save(path).map_err(vec_err_to_py) }
+
+    #[staticmethod]
+    fn load(path: &str) -> PyResult<Self> {
+        let inner = Fp16FlatIndex::load(path).map_err(vec_err_to_py)?;
+        Ok(Self { inner })
+    }
+
+    fn __repr__(&self) -> String {
+        format!("Fp16FlatIndex(dimensions={}, metric=\"{}\", len={})",
+            self.inner.config().dimensions, metric_to_str(self.inner.config().metric), self.inner.len())
+    }
+}
+
+// ── IvfIndex ─────────────────────────────────────────────────────────────────
+
+/// Inverted file index. Cluster-based ANN using k-means.
+///
+/// Auto-trains after train_size inserts. Rule of thumb: n_lists = sqrt(N).
+///
+/// Args:
+///     dimensions: Number of dimensions per vector.
+///     metric: Distance metric - "l2", "cosine", or "dot_product".
+///     n_lists: Number of clusters (default 256).
+///     nprobe: Clusters scanned per query (default 16).
+///     train_size: Vectors buffered before auto-training (default 4096).
+#[pyclass(name = "IvfIndex")]
+struct PyIvfIndex {
+    inner: IvfIndex,
+}
+
+#[pymethods]
+impl PyIvfIndex {
+    #[new]
+    #[pyo3(signature = (dimensions, metric = "l2", n_lists = 256, nprobe = 16, train_size = 4096))]
+    fn new(dimensions: usize, metric: &str, n_lists: usize, nprobe: usize, train_size: usize) -> PyResult<Self> {
+        let m = parse_metric(metric)?;
+        let cfg = IvfConfig { n_lists, nprobe, train_size, max_iter: 25 };
+        Ok(Self { inner: IvfIndex::new(dimensions, m, cfg) })
     }
 
     #[pyo3(signature = (id, vector))]
@@ -242,16 +493,168 @@ impl PyHnswIndex {
 
     #[staticmethod]
     fn load(path: &str) -> PyResult<Self> {
-        let inner = HnswIndex::load(path).map_err(vec_err_to_py)?;
+        let inner = IvfIndex::load(path).map_err(vec_err_to_py)?;
         Ok(Self { inner })
     }
 
     fn __repr__(&self) -> String {
-        format!("HnswIndex(dimensions={}, metric=\"{}\", len={})",
+        format!("IvfIndex(dimensions={}, metric=\"{}\", len={})",
             self.inner.config().dimensions, metric_to_str(self.inner.config().metric), self.inner.len())
     }
 }
 
+// ── IvfPqIndex ───────────────────────────────────────────────────────────────
+
+/// IVF with product quantization. Extreme memory reduction (~96x for 1536-dim).
+///
+/// Combines IVF coarse quantizer with PQ compression for residual vectors.
+/// Ideal for million-scale datasets.
+///
+/// Args:
+///     dimensions: Number of dimensions per vector.
+///     metric: Distance metric - "l2", "cosine", or "dot_product".
+///     n_lists: Number of IVF clusters (default 256).
+///     nprobe: Clusters scanned per query (default 16).
+///     train_size: Vectors buffered before auto-training (default 4096).
+///     pq_m: Number of PQ sub-quantizers (default 8, must divide dimensions).
+///     pq_k_sub: Centroids per sub-quantizer (default 256).
+#[pyclass(name = "IvfPqIndex")]
+struct PyIvfPqIndex {
+    inner: IvfPqIndex,
+}
+
+#[pymethods]
+impl PyIvfPqIndex {
+    #[new]
+    #[pyo3(signature = (dimensions, metric = "l2", n_lists = 256, nprobe = 16, train_size = 4096, pq_m = 8, pq_k_sub = 256))]
+    fn new(
+        dimensions: usize, metric: &str,
+        n_lists: usize, nprobe: usize, train_size: usize,
+        pq_m: usize, pq_k_sub: usize,
+    ) -> PyResult<Self> {
+        let m = parse_metric(metric)?;
+        use quiver_core::index::pq::PqConfig;
+        let cfg = IvfPqConfig {
+            n_lists, nprobe, train_size, max_iter: 25,
+            pq: PqConfig { m: pq_m, k_sub: pq_k_sub, max_iter: 25 },
+        };
+        Ok(Self { inner: IvfPqIndex::new(dimensions, m, cfg) })
+    }
+
+    #[pyo3(signature = (id, vector))]
+    fn add(&mut self, id: u64, vector: Vec<f32>) -> PyResult<()> {
+        self.inner.add(id, &vector).map_err(vec_err_to_py)
+    }
+
+    fn add_batch(&mut self, entries: Vec<(u64, Vec<f32>)>) -> PyResult<()> {
+        self.inner.add_batch(&entries).map_err(vec_err_to_py)
+    }
+
+    fn search(&self, py: Python<'_>, query: Vec<f32>, k: usize) -> PyResult<Vec<PyObject>> {
+        let results = py.allow_threads(|| self.inner.search(&query, k)).map_err(vec_err_to_py)?;
+        results.into_iter().map(|r| {
+            let dict = PyDict::new_bound(py);
+            dict.set_item("id", r.id)?;
+            dict.set_item("distance", r.distance)?;
+            Ok(dict.into())
+        }).collect()
+    }
+
+    fn delete(&mut self, id: u64) -> bool { self.inner.delete(id) }
+
+    fn flush(&mut self, py: Python<'_>) { py.allow_threads(|| self.inner.flush()); }
+
+    fn __len__(&self) -> usize { self.inner.len() }
+
+    #[getter]
+    fn dimensions(&self) -> usize { self.inner.config().dimensions }
+
+    #[getter]
+    fn metric(&self) -> &'static str { metric_to_str(self.inner.config().metric) }
+
+    fn save(&self, path: &str) -> PyResult<()> { self.inner.save(path).map_err(vec_err_to_py) }
+
+    #[staticmethod]
+    fn load(path: &str) -> PyResult<Self> {
+        let inner = IvfPqIndex::load(path).map_err(vec_err_to_py)?;
+        Ok(Self { inner })
+    }
+
+    fn __repr__(&self) -> String {
+        format!("IvfPqIndex(dimensions={}, metric=\"{}\", len={})",
+            self.inner.config().dimensions, metric_to_str(self.inner.config().metric), self.inner.len())
+    }
+}
+
+// ── MmapFlatIndex ────────────────────────────────────────────────────────────
+
+/// Memory-mapped brute-force index. Near-zero RAM usage.
+///
+/// Vectors are stored in a flat binary file and memory-mapped by the OS.
+/// Pages are loaded on demand. Best when dataset is larger than available RAM.
+///
+/// Args:
+///     dimensions: Number of dimensions per vector.
+///     metric: Distance metric - "l2", "cosine", or "dot_product".
+///     path: Path to the memory-mapped vector file.
+#[pyclass(name = "MmapFlatIndex")]
+struct PyMmapFlatIndex {
+    inner: MmapFlatIndex,
+}
+
+#[pymethods]
+impl PyMmapFlatIndex {
+    #[new]
+    #[pyo3(signature = (dimensions, metric = "l2", path = "./mmap_index.qvec"))]
+    fn new(dimensions: usize, metric: &str, path: &str) -> PyResult<Self> {
+        let m = parse_metric(metric)?;
+        let inner = MmapFlatIndex::new(dimensions, m, path).map_err(vec_err_to_py)?;
+        Ok(Self { inner })
+    }
+
+    #[pyo3(signature = (id, vector))]
+    fn add(&mut self, id: u64, vector: Vec<f32>) -> PyResult<()> {
+        self.inner.add(id, &vector).map_err(vec_err_to_py)
+    }
+
+    fn add_batch(&mut self, entries: Vec<(u64, Vec<f32>)>) -> PyResult<()> {
+        self.inner.add_batch(&entries).map_err(vec_err_to_py)
+    }
+
+    fn search(&self, py: Python<'_>, query: Vec<f32>, k: usize) -> PyResult<Vec<PyObject>> {
+        let results = py.allow_threads(|| self.inner.search(&query, k)).map_err(vec_err_to_py)?;
+        results.into_iter().map(|r| {
+            let dict = PyDict::new_bound(py);
+            dict.set_item("id", r.id)?;
+            dict.set_item("distance", r.distance)?;
+            Ok(dict.into())
+        }).collect()
+    }
+
+    fn delete(&mut self, id: u64) -> bool { self.inner.delete(id) }
+
+    fn flush(&mut self, py: Python<'_>) { py.allow_threads(|| self.inner.flush()); }
+
+    fn __len__(&self) -> usize { self.inner.len() }
+
+    #[getter]
+    fn dimensions(&self) -> usize { self.inner.config().dimensions }
+
+    #[getter]
+    fn metric(&self) -> &'static str { metric_to_str(self.inner.config().metric) }
+
+    fn __repr__(&self) -> String {
+        format!("MmapFlatIndex(dimensions={}, metric=\"{}\", len={})",
+            self.inner.config().dimensions, metric_to_str(self.inner.config().metric), self.inner.len())
+    }
+}
+
+// ── Collection ───────────────────────────────────────────────────────────────
+
+/// A named collection of vectors with WAL-backed persistence.
+///
+/// Obtained via Client.create_collection() or Client.get_collection().
+/// Supports upsert, search, delete, hybrid search, and payload filtering.
 #[pyclass(name = "Collection")]
 struct PyCollection {
     manager: Arc<RwLock<CollectionManager>>,
@@ -260,6 +663,7 @@ struct PyCollection {
 
 #[pymethods]
 impl PyCollection {
+    /// Insert or update a vector by ID with optional metadata payload.
     #[pyo3(signature = (id, vector, payload=None))]
     fn upsert(&mut self, py: Python<'_>, id: u64, vector: Vec<f32>, payload: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
         let p = match payload {
@@ -273,6 +677,9 @@ impl PyCollection {
         py.allow_threads(|| col.upsert(id, vector, p)).map_err(vec_err_to_py)
     }
 
+    /// Search for the k nearest vectors. Returns list of {"id", "distance", "payload"}.
+    ///
+    /// Supports optional payload filtering with operators: $eq, $ne, $in, $gt, $gte, $lt, $lte, $and, $or.
     #[pyo3(signature = (query, k, filter=None))]
     fn search(&self, py: Python<'_>, query: Vec<f32>, k: usize, filter: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<PyObject>> {
         let f = match filter {
@@ -295,6 +702,83 @@ impl PyCollection {
         }).collect()
     }
 
+    /// Upsert with an optional sparse vector for hybrid search.
+    ///
+    /// Args:
+    ///     id: Vector ID.
+    ///     vector: Dense vector.
+    ///     sparse_vector: Optional dict `{dimension_index: weight}` for sparse search.
+    ///     payload: Optional metadata dict.
+    #[pyo3(signature = (id, vector, sparse_vector=None, payload=None))]
+    fn upsert_hybrid(
+        &mut self, py: Python<'_>,
+        id: u64, vector: Vec<f32>,
+        sparse_vector: Option<&Bound<'_, PyDict>>,
+        payload: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let sv = match sparse_vector {
+            Some(d) => Some(py_dict_to_sparse(d)?),
+            None => None,
+        };
+        let p = match payload {
+            Some(v) if !v.is_none() => Some(py_to_json(v)?),
+            _ => None,
+        };
+        let name = self.name.clone();
+        let mut mgr = self.manager.write().unwrap();
+        let col = mgr.get_collection_mut(&name)
+            .ok_or_else(|| PyKeyError::new_err(format!("collection '{name}' not found")))?;
+        py.allow_threads(|| col.upsert_hybrid(id, vector, sv, p)).map_err(vec_err_to_py)
+    }
+
+    /// Hybrid dense+sparse search with weighted score fusion.
+    ///
+    /// Args:
+    ///     dense_query: Dense query vector.
+    ///     sparse_query: Sparse query dict `{dimension_index: weight}`.
+    ///     k: Number of results.
+    ///     dense_weight: Weight for dense similarity (default 0.7).
+    ///     sparse_weight: Weight for sparse similarity (default 0.3).
+    ///     filter: Optional payload filter dict.
+    ///
+    /// Returns:
+    ///     List of dicts with keys: id, score, dense_distance, sparse_score, payload.
+    #[pyo3(signature = (dense_query, sparse_query, k, dense_weight=0.7, sparse_weight=0.3, filter=None))]
+    fn search_hybrid(
+        &self, py: Python<'_>,
+        dense_query: Vec<f32>,
+        sparse_query: &Bound<'_, PyDict>,
+        k: usize,
+        dense_weight: f32,
+        sparse_weight: f32,
+        filter: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Vec<PyObject>> {
+        let sq = py_dict_to_sparse(sparse_query)?;
+        let f = match filter {
+            Some(v) if !v.is_none() => Some(py_to_filter(v)?),
+            _ => None,
+        };
+        let name = self.name.clone();
+        let mgr = self.manager.read().unwrap();
+        let col = mgr.get_collection(&name)
+            .ok_or_else(|| PyKeyError::new_err(format!("collection '{name}' not found")))?;
+        let results = py.allow_threads(|| {
+            col.search_hybrid(&dense_query, &sq, k, dense_weight, sparse_weight, f.as_ref())
+        }).map_err(vec_err_to_py)?;
+        results.into_iter().map(|r| {
+            let dict = PyDict::new_bound(py);
+            dict.set_item("id", r.id)?;
+            dict.set_item("score", r.score)?;
+            dict.set_item("dense_distance", r.dense_distance)?;
+            dict.set_item("sparse_score", r.sparse_score)?;
+            if let Some(p) = &r.payload {
+                dict.set_item("payload", json_to_py(py, p)?)?;
+            }
+            Ok(dict.into())
+        }).collect()
+    }
+
+    /// Delete a vector by ID. Returns True if found and removed.
     fn delete(&mut self, py: Python<'_>, id: u64) -> PyResult<bool> {
         let name = self.name.clone();
         let mut mgr = self.manager.write().unwrap();
@@ -310,6 +794,12 @@ impl PyCollection {
     }
 
     #[getter]
+    fn sparse_count(&self) -> usize {
+        let mgr = self.manager.read().unwrap();
+        mgr.get_collection(&self.name).map(|c| c.sparse_count()).unwrap_or(0)
+    }
+
+    #[getter]
     fn name(&self) -> &str { &self.name }
 
     fn __repr__(&self) -> String {
@@ -318,6 +808,18 @@ impl PyCollection {
     }
 }
 
+/// Persistent vector database client.
+///
+/// Opens a directory on disk. All writes are WAL-backed and survive restarts.
+///
+/// Args:
+///     path: Directory path for data storage (default "./data").
+///
+/// Example:
+///     >>> db = Client(path="./my_data")
+///     >>> col = db.create_collection("docs", dimensions=384, metric="cosine")
+///     >>> col.upsert(id=1, vector=[...], payload={"title": "hello"})
+///     >>> hits = col.search(query=[...], k=5)
 #[pyclass(name = "Client")]
 struct PyClient {
     manager: Arc<RwLock<CollectionManager>>,
@@ -332,20 +834,34 @@ impl PyClient {
         Ok(Self { manager: Arc::new(RwLock::new(mgr)) })
     }
 
+    /// Create a new collection.
+    ///
+    /// Args:
+    ///     name: Collection name.
+    ///     dimensions: Vector dimensions.
+    ///     metric: "cosine", "l2", or "dot_product".
+    ///     index_type: "hnsw", "flat", "quantized_flat", "fp16_flat", "ivf", "ivf_pq", or "mmap_flat".
     #[pyo3(signature = (name, dimensions, metric = "cosine", index_type = "hnsw"))]
     fn create_collection(&mut self, name: String, dimensions: usize, metric: &str, index_type: &str) -> PyResult<PyCollection> {
         let m = parse_metric(metric)?;
-        let (it, hnsw_config) = match index_type {
-            "flat" => (IndexType::Flat, None),
-            "hnsw" => (IndexType::Hnsw, Some(HnswConfig::default())),
+        let (it, hnsw_config, ivf_config) = match index_type {
+            "flat" => (IndexType::Flat, None, None),
+            "hnsw" => (IndexType::Hnsw, Some(HnswConfig::default()), None),
+            "quantized_flat" => (IndexType::QuantizedFlat, None, None),
+            "fp16_flat" => (IndexType::Fp16Flat, None, None),
+            "ivf" => (IndexType::Ivf, None, Some(IvfConfig::default())),
+            "ivf_pq" => (IndexType::IvfPq, None, None),
+            "mmap_flat" => (IndexType::MmapFlat, None, None),
             other => return Err(PyValueError::new_err(format!("unknown index_type {other:?}"))),
         };
-        let meta = CollectionMeta { name: name.clone(), dimensions, metric: m, index_type: it, hnsw_config, wal_compact_threshold: 50_000, auto_promote_threshold: None, promotion_hnsw_config: None, embedding_model: None, ivf_config: None, faiss_factory: None };
+        let ivf_pq_config = if it == IndexType::IvfPq { Some(IvfPqConfig::default()) } else { None };
+        let meta = CollectionMeta { name: name.clone(), dimensions, metric: m, index_type: it, hnsw_config, wal_compact_threshold: 50_000, auto_promote_threshold: None, promotion_hnsw_config: None, embedding_model: None, ivf_config, ivf_pq_config, faiss_factory: None };
         let mut mgr = self.manager.write().unwrap();
         mgr.create_collection(meta).map_err(vec_err_to_py)?;
         Ok(PyCollection { manager: Arc::clone(&self.manager), name })
     }
 
+    /// Get an existing collection by name. Raises KeyError if not found.
     fn get_collection(&self, name: &str) -> PyResult<PyCollection> {
         let mgr = self.manager.read().unwrap();
         if mgr.get_collection(name).is_none() {
@@ -354,6 +870,7 @@ impl PyClient {
         Ok(PyCollection { manager: Arc::clone(&self.manager), name: name.to_string() })
     }
 
+    /// Get a collection by name, or create it if it doesn't exist (uses HNSW).
     #[pyo3(signature = (name, dimensions, metric = "cosine"))]
     fn get_or_create_collection(&mut self, name: &str, dimensions: usize, metric: &str) -> PyResult<PyCollection> {
         {
@@ -365,11 +882,13 @@ impl PyClient {
         self.create_collection(name.to_string(), dimensions, metric, "hnsw")
     }
 
+    /// Delete a collection and all its data from disk.
     fn delete_collection(&mut self, name: &str) -> PyResult<bool> {
         let mut mgr = self.manager.write().unwrap();
         mgr.delete_collection(name).map_err(vec_err_to_py)
     }
 
+    /// List all collection names.
     fn list_collections(&self) -> Vec<String> {
         let mgr = self.manager.read().unwrap();
         mgr.list_collections().iter().map(|m| m.name.clone()).collect()
@@ -382,9 +901,14 @@ impl PyClient {
 }
 
 #[pymodule]
-fn quiver(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn quiver_vector_db(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyFlatIndex>()?;
     m.add_class::<PyHnswIndex>()?;
+    m.add_class::<PyQuantizedFlatIndex>()?;
+    m.add_class::<PyFp16FlatIndex>()?;
+    m.add_class::<PyIvfIndex>()?;
+    m.add_class::<PyIvfPqIndex>()?;
+    m.add_class::<PyMmapFlatIndex>()?;
     m.add_class::<PyClient>()?;
     m.add_class::<PyCollection>()?;
     Ok(())

@@ -1,607 +1,295 @@
 # Quiver
 
-An **embedded** vector database written in Rust with a Python SDK.
+A fast, embedded vector database written in Rust with a Python SDK.
+No server, no network — runs fully in-process with SIMD-accelerated search.
 
-Runs fully in-process — no server, no network, no extra processes.
+## Features
 
-Two storage modes:
+- **7 index types** — HNSW, Flat, Int8/FP16 quantized, IVF, IVF-PQ, memory-mapped
+- **3 distance metrics** — Cosine, L2, Dot Product with AVX2/NEON SIMD
+- **Hybrid search** — combine dense vectors with sparse keyword signals (BM25/SPLADE)
+- **Payload filtering** — JSON metadata with operators: `$eq`, `$ne`, `$in`, `$gt`, `$gte`, `$lt`, `$lte`, `$and`, `$or`
+- **WAL persistence** — crash-safe writes, automatic compaction
+- **Type stubs included** — full IDE autocompletion in VSCode, PyCharm, etc.
+- **Zero dependencies** — single pip install, no servers or runtimes
 
-| Mode | How | When |
-|------|-----|------|
-| **Persistent** | `Client(path=...)` | WAL-backed; survives restarts |
-| **In-memory** | Low-level index objects | Temporary; nothing written to disk unless you call `.save()` |
-
----
-
-## Table of Contents
-
-1. [Python SDK](#python-sdk)
-   - [Installation](#installation)
-   - [Persistent storage — Client](#persistent-storage--client)
-   - [In-memory storage — low-level indexes](#in-memory-storage--low-level-indexes)
-   - [Payload metadata](#payload-metadata)
-   - [Filtered search](#filtered-search)
-   - [Index types](#index-types)
-   - [Collection management](#collection-management)
-   - [Real-world example](#real-world-example)
-2. [Rust library](#rust-library)
-   - [Persistent storage](#persistent-storage-rust)
-   - [In-memory storage](#in-memory-storage-rust)
-   - [All index types via CollectionManager](#all-index-types-via-collectionmanager)
-3. [Distance metrics](#distance-metrics)
-4. [Index type reference](#index-type-reference)
-5. [On-disk layout](#on-disk-layout)
-6. [Build](#build)
-
----
-
-## Python SDK
-
-### Installation
+## Installation
 
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
+pip install quiver-vector-db
+```
+
+Prebuilt wheels for macOS (Apple Silicon / Intel) and Linux (x86_64 / ARM64). Python 3.8+.
+
+**Build from source** (requires Rust toolchain):
+
+```bash
 pip install maturin
-
-# Build and install in development mode:
 maturin develop --release -m crates/quiver-python/Cargo.toml
-
-# Verify:
-python -c "import quiver; print('Quiver ready')"
 ```
 
----
-
-### Persistent storage — Client
-
-`quiver.Client` opens a directory on disk. Every write is appended to a
-write-ahead log (WAL) and survives process restarts.
+## Quick start
 
 ```python
-import quiver
+import quiver_vector_db as quiver
 
-# Open (or create) a database directory.
-# All previously saved collections are loaded automatically.
-db = quiver.Client(path="./my_quiver_data")
+db  = quiver.Client(path="./my_data")
+col = db.create_collection("docs", dimensions=384, metric="cosine")
 
-# Create a collection — name, vector dimensions, distance metric.
-# Supported index types: "hnsw" (default, approximate) or "flat" (exact).
-col = db.create_collection("sentences", dimensions=384, metric="cosine")
+col.upsert(id=1, vector=[0.12, 0.45, ...], payload={"title": "Hello world"})
+col.upsert(id=2, vector=[0.98, 0.01, ...], payload={"title": "Vector search"})
 
-# Insert vectors. IDs are unsigned integers.
-col.upsert(id=1, vector=[0.12, 0.45, ...])   # 384-dim list of floats
-col.upsert(id=2, vector=[0.98, 0.01, ...])
-col.upsert(id=3, vector=[0.55, 0.33, ...])
-
-# Search for the k nearest neighbours.
 hits = col.search(query=[0.13, 0.44, ...], k=5)
-
 for hit in hits:
-    print(f"id={hit['id']:4d}  distance={hit['distance']:.6f}")
+    print(hit["id"], hit["distance"], hit["payload"])
 ```
 
-Reopen the same path in a later session — all collections are restored:
-
-```python
-db  = quiver.Client(path="./my_quiver_data")
-col = db.get_collection("sentences")
-hits = col.search(query=[...], k=5)
-```
+Collections are persisted via WAL — reopen the same path and everything is restored.
 
 ---
 
-### In-memory storage — low-level indexes
+## API Reference
 
-`FlatIndex` and `HnswIndex` live entirely in RAM. Nothing is written to disk
-unless you call `.save()`. Ideal for ephemeral workloads, unit tests, or
-pipelines that build a fresh index each run.
+### `Client(path="./data")`
 
-```python
-import quiver
+Persistent vector database client. Opens a directory on disk; all writes are WAL-backed.
 
-# ── FlatIndex — exact brute-force, 100% recall ────────────────────────────────
-idx = quiver.FlatIndex(dimensions=3, metric="l2")
-idx.add(id=1, vector=[1.0, 0.0, 0.0])
-idx.add(id=2, vector=[0.0, 1.0, 0.0])
-idx.add_batch([(3, [0.5, 0.5, 0.0]), (4, [0.1, 0.9, 0.0])])
+| Method | Description |
+|--------|-------------|
+| `create_collection(name, dimensions, metric="cosine", index_type="hnsw")` | Create a new collection |
+| `get_collection(name)` | Get an existing collection. Raises `KeyError` if not found |
+| `get_or_create_collection(name, dimensions, metric="cosine")` | Get or create (defaults to HNSW) |
+| `delete_collection(name)` | Delete collection and all its data from disk |
+| `list_collections()` | Returns list of collection name strings |
 
-results = idx.search(query=[0.9, 0.1, 0.0], k=2)
-for r in results:
-    print(f"id={r['id']}  dist={r['distance']:.4f}")
+### `Collection`
 
-print(len(idx))        # 4
-print(idx.dimensions)  # 3
-print(idx.metric)      # "l2"
+Returned by `Client.create_collection()` or `Client.get_collection()`.
 
-idx.delete(id=3)
+| Method | Description |
+|--------|-------------|
+| `upsert(id, vector, payload=None)` | Insert or update a vector with optional metadata dict |
+| `search(query, k, filter=None)` | Search k nearest vectors. Returns `[{"id", "distance", "payload"}]` |
+| `upsert_hybrid(id, vector, sparse_vector=None, payload=None)` | Upsert with optional sparse vector (`{dim_index: weight}`) |
+| `search_hybrid(dense_query, sparse_query, k, dense_weight=0.7, sparse_weight=0.3, filter=None)` | Hybrid search. Returns `[{"id", "score", "dense_distance", "sparse_score", "payload"}]` |
+| `delete(id)` | Delete a vector by ID. Returns `True` if found |
+| `count` | Property: number of dense vectors |
+| `sparse_count` | Property: number of sparse vectors |
+| `name` | Property: collection name |
 
-# Optional: save to disk and reload later.
-idx.save("./flat_index.bin")
-loaded = quiver.FlatIndex.load("./flat_index.bin")
+### Standalone Index Classes
 
-# ── HnswIndex — approximate nearest-neighbour, fast queries ──────────────────
-hnsw = quiver.HnswIndex(
-    dimensions=384,
-    metric="cosine",
-    ef_construction=200,   # beam width during graph build (higher = better recall, slower build)
-    ef_search=50,          # beam width at query time (higher = better recall, slower query)
-    m=12,                  # graph edges per node (higher = better recall, more RAM)
-)
+All standalone indexes share a common interface:
 
-for vid, vec in my_vectors:
-    hnsw.add(id=vid, vector=vec)
+| Method | Description |
+|--------|-------------|
+| `add(id, vector)` | Add a single vector |
+| `add_batch(entries)` | Add multiple vectors. `entries`: list of `(id, vector)` tuples |
+| `search(query, k)` | Returns `[{"id", "distance"}]` |
+| `delete(id)` | Returns `True` if removed |
+| `save(path)` / `Index.load(path)` | Persist and restore |
+| `dimensions` | Property |
+| `metric` | Property |
+| `len(idx)` | Number of vectors |
 
-hnsw.flush()   # build the HNSW graph after bulk inserts
+#### `FlatIndex(dimensions, metric="l2")`
 
-results = hnsw.search(query=query_vec, k=10)
+Exact brute-force index. 100% recall, O(N*D) per query.
 
-# Optional: persist and reload.
-hnsw.save("./hnsw_index.bin")
-loaded = quiver.HnswIndex.load("./hnsw_index.bin")
-```
+#### `HnswIndex(dimensions, metric="l2", ef_construction=200, ef_search=50, m=12)`
 
----
+Graph-based approximate nearest-neighbour index. 95-99% recall.
 
-### Payload metadata
+| Parameter | Default | Effect |
+|-----------|---------|--------|
+| `ef_construction` | 200 | Build beam width. Higher = better recall, slower build |
+| `ef_search` | 50 | Query beam width. Tunable at runtime |
+| `m` | 12 | Graph edges per node. Higher = better recall, more RAM |
 
-Each vector can carry an arbitrary JSON-serialisable `dict` as metadata.
-Payloads are stored alongside the vector and returned with every search result.
+Additional method: `flush()` — build the HNSW graph after bulk inserts.
 
-> **Note:** Payloads are only available through `Client` / `Collection`.
-> The low-level `FlatIndex` and `HnswIndex` objects store vectors only.
+#### `QuantizedFlatIndex(dimensions, metric="l2")`
 
-```python
-import quiver
+Int8 quantized brute-force. ~4x less RAM, ~99% recall.
 
-db  = quiver.Client(path="./data")
-col = db.create_collection("articles", dimensions=1536, metric="cosine")
+#### `Fp16FlatIndex(dimensions, metric="l2")`
 
-col.upsert(id=1, vector=embedding_1, payload={
-    "title":    "Introduction to Rust",
-    "author":   "Jane Smith",
-    "category": "programming",
-    "score":    4.8,
-})
-col.upsert(id=2, vector=embedding_2, payload={
-    "title":    "Vector Databases Explained",
-    "author":   "Bob Jones",
-    "category": "databases",
-    "score":    4.5,
-})
+Float16 quantized brute-force. 2x less RAM, >99.5% recall.
 
-hits = col.search(query=query_embedding, k=3)
-for hit in hits:
-    print(f"{hit['id']} — {hit['payload']['title']} (dist={hit['distance']:.4f})")
-```
+#### `IvfIndex(dimensions, metric="l2", n_lists=256, nprobe=16, train_size=4096)`
 
----
+Cluster-based ANN using k-means. Auto-trains after `train_size` inserts.
 
-### Filtered search
+| Parameter | Default | Effect |
+|-----------|---------|--------|
+| `n_lists` | 256 | Number of clusters (rule of thumb: `sqrt(N)`) |
+| `nprobe` | 16 | Clusters scanned per query |
+| `train_size` | 4096 | Vectors buffered before auto-training |
 
-Pass a `filter` dict to `search()` to restrict results to vectors whose
-payload matches the condition. Filters are applied before ranking.
+Additional method: `flush()` — trigger training.
 
-**Supported operators:** `$eq`, `$ne`, `$in`, `$gt`, `$gte`, `$lt`, `$lte`,
-`$and`, `$or`. Dot-notation accesses nested fields (`"meta.author"`).
+#### `IvfPqIndex(dimensions, metric="l2", n_lists=256, nprobe=16, train_size=4096, pq_m=8, pq_k_sub=256)`
 
-```python
-col = db.get_collection("articles")
+IVF with product quantization. ~96x memory reduction for 1536-dim vectors.
 
-# Equality
-hits = col.search(query=query_embedding, k=5,
-    filter={"category": {"$eq": "programming"}})
+| Parameter | Default | Effect |
+|-----------|---------|--------|
+| `pq_m` | 8 | Sub-quantizers (must divide `dimensions`). Memory per vector = `pq_m` bytes |
+| `pq_k_sub` | 256 | Centroids per sub-quantizer |
 
-# Exclusion
-hits = col.search(query=query_embedding, k=5,
-    filter={"category": {"$ne": "spam"}})
+Additional method: `flush()` — trigger training.
 
-# Set membership
-hits = col.search(query=query_embedding, k=5,
-    filter={"category": {"$in": ["programming", "databases"]}})
+#### `MmapFlatIndex(dimensions, metric="l2", path="./mmap_index.qvec")`
 
-# Numeric range
-hits = col.search(query=query_embedding, k=5,
-    filter={"score": {"$gte": 4.5}})
-
-# AND — all conditions must match
-hits = col.search(query=query_embedding, k=5,
-    filter={
-        "$and": [
-            {"category": {"$eq": "programming"}},
-            {"score":    {"$gte": 4.0}},
-        ]
-    })
-
-# OR — at least one condition must match
-hits = col.search(query=query_embedding, k=5,
-    filter={
-        "$or": [
-            {"category": {"$eq": "programming"}},
-            {"category": {"$eq": "databases"}},
-        ]
-    })
-
-# Nested field via dot notation
-hits = col.search(query=query_embedding, k=5,
-    filter={"meta.author": {"$eq": "Jane Smith"}})
-```
+Memory-mapped brute-force. Near-zero RAM; pages loaded on demand by the OS. Additional method: `flush()`.
 
 ---
 
-### Index types
+## Index types
 
-`Client.create_collection` supports two index types:
+Seven index types, all usable via `Client` or standalone:
 
-| `index_type` | Recall | Best for |
-|---|---|---|
-| `"hnsw"` (default) | 95–99% | General purpose, any dataset size |
-| `"flat"` | 100% exact | Small datasets or when exact recall is required |
-
-HNSW uses sensible defaults (`ef_construction=200`, `ef_search=50`, `m=12`).
-To tune HNSW parameters directly, use the in-memory `HnswIndex` and manage
-persistence with `.save()` / `.load()`.
+| Index | Recall | RAM | Best for |
+|-------|--------|-----|----------|
+| `hnsw` | 95-99% | Vectors + graph | General purpose (default) |
+| `flat` | 100% | All vectors (f32) | Small datasets, exact required |
+| `quantized_flat` | ~99% | ~4x less (int8) | Memory-constrained exact search |
+| `fp16_flat` | >99.5% | ~2x less (float16) | Balanced memory vs accuracy |
+| `ivf` | Tunable | Vectors + centroids | Large datasets |
+| `ivf_pq` | ~90%+ | ~96x less (PQ codes) | Million-scale, extreme compression |
+| `mmap_flat` | 100% | Near-zero RSS | Dataset larger than RAM |
 
 ```python
+import quiver_vector_db as quiver
+
+# Via Client (WAL-persisted)
 db = quiver.Client(path="./data")
+col = db.create_collection("name", dimensions=768, metric="cosine", index_type="hnsw")
 
-# HNSW — approximate, fast (default)
-col = db.create_collection("ann", dimensions=768, metric="cosine", index_type="hnsw")
-
-# Flat — exact brute-force
-col = db.create_collection("exact", dimensions=768, metric="cosine", index_type="flat")
+# Standalone in-memory
+idx = quiver.FlatIndex(dimensions=384, metric="cosine")
+idx = quiver.HnswIndex(dimensions=384, metric="cosine", ef_construction=200, ef_search=50, m=12)
+idx = quiver.QuantizedFlatIndex(dimensions=384, metric="cosine")
+idx = quiver.Fp16FlatIndex(dimensions=384, metric="cosine")
+idx = quiver.IvfIndex(dimensions=384, metric="l2", n_lists=256, nprobe=16, train_size=4096)
+idx = quiver.IvfPqIndex(dimensions=384, metric="l2", n_lists=256, nprobe=16, train_size=4096, pq_m=8, pq_k_sub=256)
+idx = quiver.MmapFlatIndex(dimensions=384, metric="cosine", path="./vectors.qvec")
 ```
-
----
-
-### Collection management
-
-```python
-db = quiver.Client(path="./data")
-
-# Create only if it doesn't exist yet (idempotent, uses HNSW).
-col = db.get_or_create_collection("docs", dimensions=768, metric="cosine")
-
-# Get a handle to an existing collection.
-col = db.get_collection("docs")
-
-# List all collection names.
-print(db.list_collections())   # ['docs', 'articles', ...]
-
-# Count vectors.
-print(col.count)               # 1024
-
-# Upsert = insert or overwrite by ID.
-col.upsert(id=42, vector=new_vec, payload={"updated": True})
-
-# Delete a single vector by ID.
-col.delete(id=42)
-
-# Drop an entire collection and remove all data from disk.
-db.delete_collection("docs")
-```
-
----
-
-### Real-world example
-
-Semantic search over documents using `sentence-transformers`:
-
-```python
-import quiver
-from sentence_transformers import SentenceTransformer
-
-model = SentenceTransformer("all-MiniLM-L6-v2")  # 384-dim embeddings
-
-docs = [
-    {"id": 1, "text": "Rust is a systems programming language focused on safety."},
-    {"id": 2, "text": "Python is great for data science and machine learning."},
-    {"id": 3, "text": "Vector databases store embeddings for similarity search."},
-    {"id": 4, "text": "HNSW is a graph-based approximate nearest neighbour algorithm."},
-]
-
-db  = quiver.Client(path="./semantic_data")
-col = db.get_or_create_collection("docs", dimensions=384, metric="cosine")
-
-for doc in docs:
-    vec = model.encode(doc["text"]).tolist()
-    col.upsert(id=doc["id"], vector=vec, payload={"text": doc["text"]})
-
-# Similarity search
-query_vec = model.encode("how do embeddings work?").tolist()
-hits = col.search(query=query_vec, k=3)
-for hit in hits:
-    print(f"  [{hit['distance']:.4f}] {hit['payload']['text']}")
-
-# Filtered search
-hits = col.search(
-    query=query_vec,
-    k=3,
-    filter={"$or": [
-        {"text": {"$eq": "Rust is a systems programming language focused on safety."}},
-        {"text": {"$eq": "Python is great for data science and machine learning."}},
-    ]}
-)
-```
-
----
-
-## Rust library
-
-`quiver-core` is a pure Rust library — no async runtime, no network dependencies.
-
-```toml
-[dependencies]
-quiver-core = { path = "./crates/quiver-core" }
-serde_json   = "1"
-```
-
-### Persistent storage (Rust)
-
-```rust
-use quiver_core::db::Quiver;
-use quiver_core::distance::Metric;
-use quiver_core::payload::FilterCondition;
-use serde_json::json;
-
-let mut db = Quiver::open("./my_quiver_data")?;
-
-db.create_collection("sentences", 384, Metric::Cosine)?;
-db.upsert("sentences", 1, &[0.12, 0.45, /* ... */], None)?;
-db.upsert("sentences", 2, &[0.98, 0.01, /* ... */], None)?;
-
-let hits = db.search("sentences", &[0.13, 0.44, /* ... */], 5)?;
-for hit in &hits {
-    println!("id={:4}  distance={:.6}", hit.id, hit.distance);
-}
-
-// Filtered search
-let filter: FilterCondition = serde_json::from_value(json!({
-    "$and": [
-        { "category": { "$eq": "programming" } },
-        { "score":    { "$gte": 4.0 } }
-    ]
-}))?;
-let hits = db.search_filtered("articles", &query, 5, &filter)?;
-
-// Collection management
-db.get_or_create_collection("docs", 768, Metric::Cosine)?;
-let names = db.list_collections();
-let n     = db.count("docs")?;
-db.delete("docs", 42)?;
-db.delete_collection("docs")?;
-```
-
-### In-memory storage (Rust)
-
-Use the index types directly. No WAL, no directory — nothing hits disk
-unless you call `.save()`.
-
-```rust
-use quiver_core::index::flat::FlatIndex;
-use quiver_core::index::hnsw::{HnswConfig, HnswIndex};
-use quiver_core::index::VectorIndex;
-use quiver_core::distance::Metric;
-
-// ── FlatIndex (exact, 100% recall) ────────────────────────────────────────────
-let mut flat = FlatIndex::new(3, Metric::L2);
-flat.add(1, &[1.0, 0.0, 0.0])?;
-flat.add(2, &[0.0, 1.0, 0.0])?;
-flat.add_batch(&[(3, vec![0.5, 0.5, 0.0])])?;
-
-let results = flat.search(&[0.9, 0.1, 0.0], 2)?;
-flat.save("./flat.bin")?;
-let loaded = FlatIndex::load("./flat.bin")?;
-
-// ── HnswIndex (approximate, fast) ─────────────────────────────────────────────
-let cfg = HnswConfig { ef_construction: 200, ef_search: 50, m: 12 };
-let mut hnsw = HnswIndex::new(384, Metric::Cosine, cfg);
-
-for (id, vec) in &my_vectors {
-    hnsw.add(*id, vec)?;
-}
-hnsw.flush();             // build graph after bulk insert
-hnsw.set_ef_search(100);  // tune recall at query time without rebuilding
-
-let results = hnsw.search(&query, 10)?;
-hnsw.save("./hnsw.bin")?;
-let loaded = HnswIndex::load("./hnsw.bin")?;
-```
-
-### All index types via CollectionManager
-
-`CollectionManager` provides direct access to all six index types. All are
-persistent (WAL-backed). The Python SDK currently exposes `"flat"` and `"hnsw"`
-only; the remaining types are available to Rust users.
-
-```rust
-use quiver_core::manager::CollectionManager;
-use quiver_core::collection::{CollectionMeta, IndexType};
-use quiver_core::distance::Metric;
-use quiver_core::index::hnsw::HnswConfig;
-use quiver_core::index::ivf::IvfConfig;
-
-let mut mgr = CollectionManager::open("./data")?;
-
-// Flat — exact, O(N·D) per query
-mgr.create_collection(CollectionMeta {
-    name: "exact".into(), dimensions: 768, metric: Metric::Cosine,
-    index_type: IndexType::Flat,
-    hnsw_config: None, ivf_config: None, faiss_factory: None,
-    wal_compact_threshold: 50_000,
-    auto_promote_threshold: None, promotion_hnsw_config: None,
-    embedding_model: None,
-})?;
-
-// HNSW — ~95–99% recall, O(log N · ef) per query
-mgr.create_collection(CollectionMeta {
-    name: "ann".into(), dimensions: 768, metric: Metric::Cosine,
-    index_type: IndexType::Hnsw,
-    hnsw_config: Some(HnswConfig { ef_construction: 200, ef_search: 50, m: 12 }),
-    ivf_config: None, faiss_factory: None,
-    wal_compact_threshold: 50_000,
-    auto_promote_threshold: None, promotion_hnsw_config: None,
-    embedding_model: None,
-})?;
-
-// QuantizedFlat — int8 brute-force, ~4× less RAM, ~99% recall vs Flat
-mgr.create_collection(CollectionMeta {
-    name: "quantized".into(), dimensions: 1536, metric: Metric::Cosine,
-    index_type: IndexType::QuantizedFlat,
-    hnsw_config: None, ivf_config: None, faiss_factory: None,
-    wal_compact_threshold: 50_000,
-    auto_promote_threshold: None, promotion_hnsw_config: None,
-    embedding_model: None,
-})?;
-
-// IVF — cluster-based ANN; auto-trains after train_size inserts
-// Rule of thumb: n_lists = sqrt(N), nprobe = sqrt(n_lists)
-mgr.create_collection(CollectionMeta {
-    name: "ivf".into(), dimensions: 768, metric: Metric::L2,
-    index_type: IndexType::Ivf,
-    ivf_config: Some(IvfConfig { n_lists: 256, nprobe: 16, train_size: 4096, max_iter: 25 }),
-    hnsw_config: None, faiss_factory: None,
-    wal_compact_threshold: 50_000,
-    auto_promote_threshold: None, promotion_hnsw_config: None,
-    embedding_model: None,
-})?;
-
-// MmapFlat — disk-mapped brute-force; near-zero RAM; OS pages in as needed
-mgr.create_collection(CollectionMeta {
-    name: "mmap".into(), dimensions: 768, metric: Metric::Cosine,
-    index_type: IndexType::MmapFlat,
-    hnsw_config: None, ivf_config: None, faiss_factory: None,
-    wal_compact_threshold: 50_000,
-    auto_promote_threshold: None, promotion_hnsw_config: None,
-    embedding_model: None,
-})?;
-
-// FAISS — requires `--features faiss` and libfaiss_c
-// Factory strings: "Flat", "IVF1024,Flat", "IVF256,PQ64", "HNSW32"
-#[cfg(feature = "faiss")]
-mgr.create_collection(CollectionMeta {
-    name: "faiss_ivf".into(), dimensions: 768, metric: Metric::L2,
-    index_type: IndexType::Faiss,
-    faiss_factory: Some("IVF1024,Flat".into()),
-    hnsw_config: None, ivf_config: None,
-    wal_compact_threshold: 50_000,
-    auto_promote_threshold: None, promotion_hnsw_config: None,
-    embedding_model: None,
-})?;
-
-// Auto-promote: start exact, automatically switch to HNSW at threshold
-mgr.create_collection(CollectionMeta {
-    name: "auto".into(), dimensions: 768, metric: Metric::Cosine,
-    index_type: IndexType::Flat,
-    auto_promote_threshold: Some(10_000),
-    promotion_hnsw_config:  Some(HnswConfig::default()),
-    hnsw_config: None, ivf_config: None, faiss_factory: None,
-    wal_compact_threshold: 50_000,
-    embedding_model: None,
-})?;
-```
-
----
 
 ## Distance metrics
 
-| Metric | Rust | Python | Use when |
-|--------|------|--------|----------|
-| Cosine | `Metric::Cosine` | `"cosine"` | Text/image embeddings (most common) |
-| Euclidean (L2) | `Metric::L2` | `"l2"` | Geometry, sensor data, unnormalised vectors |
-| Dot product | `Metric::DotProduct` | `"dot_product"` | Pre-normalised vectors, recommendation models |
+| Metric | String | Use when |
+|--------|--------|----------|
+| Cosine | `"cosine"` | Text/image embeddings (most common) |
+| L2 | `"l2"` | Geometry, sensor data |
+| Dot product | `"dot_product"` | Pre-normalised vectors |
 
-> Most embedding models output cosine-space vectors. Use `"cosine"` unless your
-> model documentation says otherwise.
+All metrics use SIMD-accelerated kernels (AVX2+FMA on x86, NEON on ARM).
 
----
+## Payload & filtered search
 
-## Index type reference
+```python
+col.upsert(id=1, vector=[...], payload={"category": "tech", "score": 4.8})
 
-### Python SDK
-
-| API | Index | Storage | Recall | Notes |
-|-----|-------|---------|--------|-------|
-| `create_collection(..., index_type="hnsw")` | HNSW | Persistent (WAL) | 95–99% | Default; fast approximate search |
-| `create_collection(..., index_type="flat")` | Flat | Persistent (WAL) | 100% | Exact; slower on large datasets |
-| `FlatIndex(...)` | Flat | **In-memory** | 100% | No WAL; optional `.save()` / `.load()` |
-| `HnswIndex(...)` | HNSW | **In-memory** | 95–99% | Configurable; optional `.save()` / `.load()` |
-
-### Rust (all index types)
-
-| Index | Recall | Query complexity | RAM | Best for |
-|-------|--------|-----------------|-----|----------|
-| Flat | 100% | O(N·D) | All vectors (f32) | <100K vectors, exact required |
-| HNSW | 95–99% | O(log N · ef) | All vectors + graph | General purpose |
-| QuantizedFlat | ~99% | O(N·D) | **~4× less** (int8) | Memory-constrained exact search |
-| IVF | Tunable | O(n\_lists + nprobe·N/n\_lists) | All vectors | Large datasets with training phase |
-| MmapFlat | 100% | O(N·D) disk-paged | Staging only | Dataset larger than RAM |
-| FAISS | Varies | Varies | Varies | GPU, PQ compression, custom factory |
-
-### HNSW parameters
-
-| Parameter | Default | Effect |
-|-----------|---------|--------|
-| `ef_construction` | 200 | Build beam width — higher = better recall, slower build |
-| `ef_search` | 50 | Query beam width — tunable at runtime without rebuild |
-| `m` | 12 | Edges per node per layer — higher = better recall, more RAM |
-
-### IVF parameters (Rust only)
-
-| Parameter | Default | Effect |
-|-----------|---------|--------|
-| `n_lists` | 256 | k-means clusters — rule of thumb: `sqrt(N)` |
-| `nprobe` | 16 | Clusters scanned per query — higher = better recall, slower |
-| `train_size` | 4096 | Vectors buffered before training triggers automatically |
-| `max_iter` | 25 | Lloyd's k-means iterations |
-
----
-
-## On-disk layout
-
-```
-my_quiver_data/
-├── sentences/
-│   ├── meta.json   ← collection config (dimensions, metric, index type)
-│   └── wal.log     ← write-ahead log; replayed on open to rebuild the index
-├── mmap_col/
-│   ├── meta.json
-│   ├── wal.log
-│   └── vectors.mmap   ← memory-mapped vector file (MmapFlat only)
-└── ...
+# Filter operators: $eq, $ne, $in, $gt, $gte, $lt, $lte, $and, $or
+hits = col.search(query=[...], k=5, filter={"category": {"$eq": "tech"}})
+hits = col.search(query=[...], k=5, filter={"score": {"$gte": 4.0}})
+hits = col.search(query=[...], k=5, filter={
+    "$and": [
+        {"category": {"$in": ["tech", "science"]}},
+        {"score": {"$gte": 4.0}},
+    ]
+})
 ```
 
-- **`meta.json`** — human-readable collection metadata
-- **`wal.log`** — binary append log (bincode frames); the authoritative record of all writes
-- **`vectors.mmap`** — flat binary vector file for `MmapFlatIndex`
+## Hybrid dense+sparse search
 
-In-memory indexes (`FlatIndex`, `HnswIndex` used directly) write nothing
-unless you explicitly call `.save(path)`.
+Combine dense vector similarity with sparse keyword signals (e.g. BM25/SPLADE weights):
 
----
+```python
+col.upsert_hybrid(
+    id=1, vector=[...],
+    sparse_vector={42: 0.8, 100: 0.5, 3001: 0.3},
+    payload={"title": "Rust guide"},
+)
 
-## Build
+hits = col.search_hybrid(
+    dense_query=[...],
+    sparse_query={42: 0.7, 100: 0.6},
+    k=10,
+    dense_weight=0.7,
+    sparse_weight=0.3,
+    filter={"category": {"$eq": "tech"}},  # optional
+)
+
+for hit in hits:
+    print(hit["id"], hit["score"], hit["dense_distance"], hit["sparse_score"])
+```
+
+Regular `upsert()` and `upsert_hybrid()` can be mixed freely in the same collection.
+
+## Persistence
+
+All data written through `Client` is WAL-backed:
+
+- **Crash-safe** — length-prefixed binary frames; partial writes are safely skipped on recovery
+- **Automatic compaction** — after 50K WAL entries, live state is rewritten and tombstones discarded
+- **Graph snapshots** — HNSW graph structure is saved to skip O(N log N) rebuild on reload
+- **Reopen anytime** — point `Client` at the same directory and all collections are restored
+
+Standalone indexes can be saved/loaded manually with `save(path)` and `Index.load(path)`.
+
+## IDE support
+
+Quiver ships with `py.typed` and `.pyi` type stubs. Autocompletion, type checking, and inline docs work out of the box in VSCode, PyCharm, and any editor that supports PEP 561.
+
+## Development
+
+### Prerequisites
+
+- Rust toolchain (`rustup`, `cargo`)
+- Python 3.8+
+
+### Environment setup
 
 ```bash
-# Build and test quiver-core
-./dev_build.sh
-
-# Build Python wheel and smoke-test
+git clone https://github.com/rhshriva/Quiver.git && cd Quiver
 python3 -m venv .venv && source .venv/bin/activate
-pip install maturin
-./dev_build.sh --python
-
-# Build with FAISS support (requires libfaiss_c)
-./dev_build.sh --faiss --python
+pip install maturin pytest numpy
+maturin develop --release -m crates/quiver-python/Cargo.toml
 ```
 
----
+### Build
 
-## Crates
+```bash
+./dev_build.sh               # build + test Rust core
+./dev_build.sh --python       # also build Python wheel
+./dev_build.sh --faiss --python  # with FAISS support
+```
 
-| Crate | Purpose |
-|-------|---------|
-| `quiver-core` | Embedded vector database engine — indexes, WAL, filtering, distance metrics |
-| `quiver-python` | Python bindings via PyO3/maturin |
+### Running tests
+
+```bash
+# Rust unit tests (175 tests)
+cargo test --workspace
+
+# Python functional tests
+pytest tests/ -v --ignore=tests/test_perf.py
+
+# Python performance benchmarks (insert throughput, search latency, recall)
+pytest tests/test_perf.py -v -s
+
+# All Python tests
+pytest tests/ -v -s
+```
+
+### Publishing
+
+```bash
+./publish.sh              # build cross-platform wheels + upload to PyPI
+./publish.sh --test       # upload to TestPyPI instead
+./publish.sh --build-only # build wheels without uploading
+```
 
 ## License
 

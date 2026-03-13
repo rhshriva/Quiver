@@ -31,6 +31,10 @@ pub enum WalEntry {
         vector: Vec<f32>,
         /// JSON-encoded payload bytes, or `None` when there is no payload.
         payload_bytes: Option<Vec<u8>>,
+        /// Bincode-encoded sparse vector bytes, or `None` when not a hybrid insert.
+        /// Added in V2 — older WALs will deserialize this as `None` via `#[serde(default)]`.
+        #[serde(default)]
+        sparse_bytes: Option<Vec<u8>>,
     },
     Delete {
         id: u64,
@@ -169,7 +173,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn add_entry(id: u64, vec: Vec<f32>) -> WalEntry {
-        WalEntry::Add { id, vector: vec, payload_bytes: None }
+        WalEntry::Add { id, vector: vec, payload_bytes: None, sparse_bytes: None }
     }
 
     fn add_entry_with_payload(id: u64, vec: Vec<f32>, payload: serde_json::Value) -> WalEntry {
@@ -177,6 +181,7 @@ mod tests {
             id,
             vector: vec,
             payload_bytes: Some(serde_json::to_vec(&payload).unwrap()),
+            sparse_bytes: None,
         }
     }
 
