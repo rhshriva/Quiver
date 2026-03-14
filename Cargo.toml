@@ -45,6 +45,9 @@ half = { version = "2", features = ["serde"] }
 # LRU cache for IndexRegistry
 lru = "0.12"
 
+# Parallel iteration for multi-threaded HNSW insert
+rayon = "1.10"
+
 # FAISS bindings (optional; requires libfaiss_c to be installed or use features=["static"])
 # NOTE: optional = true must live in the crate-level Cargo.toml, not here.
 faiss = "0.13"

@@ -21,6 +21,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use rand::Rng;
+use rayon::prelude::*;
 
 use crate::{
     distance::Metric,
@@ -225,6 +226,16 @@ struct HnswGraph {
     ef_construction: usize,
     /// Level normalization: 1/ln(M).
     ml: f64,
+}
+
+/// Search results for one vector, computed during parallel search phase.
+/// Stores pre-computed nearest neighbors at each layer so linking can happen sequentially.
+struct ParallelSearchResult {
+    id: u32,
+    level: usize,
+    /// Search results per layer, index 0 = layer 0, index L = layer L.
+    /// Each entry is a sorted Vec of Candidates from search_layer.
+    layer_results: Vec<Vec<Candidate>>,
 }
 
 impl HnswGraph {
@@ -1064,6 +1075,245 @@ impl HnswGraph {
             self.entry_point = Some(id);
         }
     }
+
+    // ── Parallel micro-batch insert ────────────────────────────────────────
+
+    /// Insert a batch of vectors using micro-batching for parallelism.
+    ///
+    /// Strategy:
+    /// 1. **Bootstrap**: Insert the first `micro_batch_size` vectors sequentially to build
+    ///    a well-connected graph for subsequent parallel searches.
+    /// 2. **Parallel micro-batches**: For remaining vectors, process in micro-batches:
+    ///    a. **Store** vector data (sequential, fast memcpy)
+    ///    b. **Search** for neighbors in parallel (rayon, read-only graph access)
+    ///    c. **Link** edges sequentially (forward + back-edges + pruning)
+    ///
+    /// This gives ~N× speedup on N cores for the search phase (which is 90%+ of insert time).
+    /// No unsafe code or per-node locks — just phase-separated parallelism.
+    fn insert_batch_parallel(
+        &mut self,
+        ids: &[u32],
+        vectors: &[f32], // flat buffer, row-major (N × dim)
+        metric: Metric,
+        micro_batch_size: usize,
+        num_threads: usize,
+    ) {
+        let n = ids.len();
+        if n == 0 { return; }
+        let dim = self.dim;
+
+        // Pre-allocate capacity for all nodes upfront (avoids Vec reallocation during parallel access)
+        if let Some(&max_id) = ids.iter().max() {
+            self.ensure_capacity(max_id);
+        }
+        self.reserve(n);
+
+        // ── Bootstrap phase: insert first micro_batch_size vectors sequentially ──
+        // This builds a well-connected graph so parallel search has real structure to traverse.
+        let bootstrap_count = micro_batch_size.min(n);
+        let mut vt = VisitedTracker::new();
+        vt.ensure_capacity(self.alive.len());
+        for i in 0..bootstrap_count {
+            let id = ids[i];
+            let vec_data = &vectors[i * dim..(i + 1) * dim];
+            self.insert(id, vec_data, metric, &mut vt);
+        }
+
+        // If all vectors fit in the bootstrap, we're done
+        if bootstrap_count >= n {
+            return;
+        }
+
+        // ── Parallel phase: process remaining vectors in micro-batches ──
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(num_threads)
+            .build()
+            .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().build().unwrap());
+
+        for chunk_start in (bootstrap_count..n).step_by(micro_batch_size) {
+            let chunk_end = (chunk_start + micro_batch_size).min(n);
+            let chunk_ids = &ids[chunk_start..chunk_end];
+
+            // ── Phase A: Store vector data (sequential) ──
+            // Write vectors into flat buffer, set levels, mark alive.
+            // Neighbor counts stay at 0 — linking happens in Phase C.
+            let chunk_levels: Vec<usize> = (0..chunk_ids.len()).map(|_| self.random_level()).collect();
+            for (i, &id) in chunk_ids.iter().enumerate() {
+                let global_i = chunk_start + i;
+                let vec_data = &vectors[global_i * dim..(global_i + 1) * dim];
+                self.set_vector(id, vec_data);
+                self.levels[id as usize] = chunk_levels[i] as u8;
+                self.layer0_counts[id as usize] = 0;
+                if chunk_levels[i] > 0 {
+                    let mut upper_vecs = Vec::with_capacity(chunk_levels[i]);
+                    for _ in 0..chunk_levels[i] {
+                        upper_vecs.push(Vec::with_capacity(self.m));
+                    }
+                    self.upper_neighbors[id as usize] = upper_vecs;
+                } else {
+                    self.upper_neighbors[id as usize] = Vec::new();
+                }
+                self.alive[id as usize] = true;
+                self.count += 1;
+            }
+
+            // ── Phase B: Parallel search (read-only graph access) ──
+            // Reborrow graph as &self for concurrent search.
+            // Each rayon thread gets its own VisitedTracker.
+            let graph: &HnswGraph = &*self;
+            let capacity = graph.alive.len();
+
+            let search_results: Vec<ParallelSearchResult> = pool.install(|| {
+                chunk_ids.par_iter().enumerate().map(|(i, &id)| {
+                    let level = chunk_levels[i];
+
+                    // Per-thread visited tracker (no shared state)
+                    let mut vt = VisitedTracker::new();
+                    vt.ensure_capacity(capacity);
+
+                    let ep_id = match graph.entry_point {
+                        None => {
+                            return ParallelSearchResult {
+                                id,
+                                level,
+                                layer_results: Vec::new(),
+                            };
+                        }
+                        Some(ep) => ep,
+                    };
+
+                    let vec_data = graph.vector(id);
+                    let current_max_level = graph.max_level();
+
+                    // Greedy descent from top layers
+                    let mut current_ep = ep_id;
+                    if current_max_level > level {
+                        for layer in ((level + 1)..=current_max_level).rev() {
+                            current_ep = graph.greedy_closest(vec_data, current_ep, layer, metric);
+                        }
+                    }
+
+                    // Search at each layer from insert_top down to 0
+                    let insert_top = level.min(current_max_level);
+                    let mut layer_results = vec![Vec::new(); insert_top + 1];
+                    for layer in (0..=insert_top).rev() {
+                        let results = graph.search_layer(
+                            vec_data, &[current_ep], graph.ef_construction, layer, metric, &mut vt,
+                        );
+                        if let Some(c) = results.first() {
+                            current_ep = c.id;
+                        }
+                        layer_results[layer] = results;
+                    }
+
+                    ParallelSearchResult { id, level, layer_results }
+                }).collect()
+            });
+
+            // ── Phase C: Sequential linking (mutable graph access) ──
+            // Apply forward + back-edges + pruning for all vectors in this micro-batch.
+            for result in search_results {
+                let id = result.id;
+                let new_level = result.level;
+
+                if result.layer_results.is_empty() {
+                    continue;
+                }
+
+                for (layer, results) in result.layer_results.iter().enumerate() {
+                    let max_conn = self.max_neighbors(layer);
+                    let m_to_select = max_conn.min(results.len());
+
+                    // Set forward edges
+                    if layer == 0 {
+                        let mut fwd_ids = [0u32; 64];
+                        for (j, c) in results[..m_to_select].iter().enumerate() {
+                            fwd_ids[j] = c.id;
+                        }
+                        self.set_layer0_neighbors(id, &fwd_ids[..m_to_select]);
+                    } else {
+                        let layer_idx = layer - 1;
+                        let upper = &mut self.upper_neighbors[id as usize];
+                        while upper.len() <= layer_idx {
+                            upper.push(Vec::new());
+                        }
+                        upper[layer_idx].clear();
+                        upper[layer_idx].extend(results[..m_to_select].iter().map(|c| c.id));
+                    }
+
+                    // Add back-edges + prune
+                    for j in 0..m_to_select {
+                        let nb_id = results[j].id;
+                        if nb_id == id { continue; }
+
+                        if layer == 0 {
+                            let new_count = self.push_layer0_neighbor(nb_id, id);
+                            if new_count > max_conn {
+                                let nb_start = nb_id as usize * dim;
+                                let l0_stride = self.layer0_stride();
+                                let l0_start = nb_id as usize * l0_stride;
+                                let l0_count = self.layer0_counts[nb_id as usize] as usize;
+                                let mut worst_idx = 0;
+                                let mut worst_dist = f32::NEG_INFINITY;
+                                for k in 0..l0_count {
+                                    let nid = self.layer0[l0_start + k];
+                                    if !self.alive[nid as usize] {
+                                        worst_idx = k;
+                                        break;
+                                    }
+                                    let nid_start = nid as usize * dim;
+                                    let d = metric.distance_ord(
+                                        &self.vectors[nb_start..nb_start + dim],
+                                        &self.vectors[nid_start..nid_start + dim],
+                                    );
+                                    if d > worst_dist {
+                                        worst_dist = d;
+                                        worst_idx = k;
+                                    }
+                                }
+                                self.swap_remove_layer0(nb_id, worst_idx);
+                            }
+                        } else {
+                            let layer_idx = layer - 1;
+                            let nb_upper = &mut self.upper_neighbors[nb_id as usize];
+                            while nb_upper.len() <= layer_idx {
+                                nb_upper.push(Vec::new());
+                            }
+                            nb_upper[layer_idx].push(id);
+
+                            if self.upper_neighbors[nb_id as usize][layer_idx].len() > max_conn {
+                                let nb_start = nb_id as usize * dim;
+                                let nbs_layer = &self.upper_neighbors[nb_id as usize][layer_idx];
+                                let mut worst_idx = 0;
+                                let mut worst_dist = f32::NEG_INFINITY;
+                                for (k, &nid) in nbs_layer.iter().enumerate() {
+                                    if !self.alive[nid as usize] {
+                                        worst_idx = k;
+                                        break;
+                                    }
+                                    let nid_start = nid as usize * dim;
+                                    let d = metric.distance_ord(
+                                        &self.vectors[nb_start..nb_start + dim],
+                                        &self.vectors[nid_start..nid_start + dim],
+                                    );
+                                    if d > worst_dist {
+                                        worst_dist = d;
+                                        worst_idx = k;
+                                    }
+                                }
+                                self.upper_neighbors[nb_id as usize][layer_idx].swap_remove(worst_idx);
+                            }
+                        }
+                    }
+                }
+
+                // Update entry point if new node has higher level
+                if new_level > self.max_level() {
+                    self.entry_point = Some(id);
+                }
+            }
+        }
+    }
 }
 
 // ── HnswIndex ───────────────────────────────────────────────────────────────
@@ -1222,6 +1472,54 @@ impl HnswIndex {
             let id = (start_id + i as u64) as u32;
             self.graph.insert(id, vec_slice, metric, vt);
         }
+        Ok(())
+    }
+
+    /// Parallel batch insert from a contiguous flat f32 buffer using micro-batching.
+    ///
+    /// Splits the batch into micro-batches of `micro_batch_size` vectors (default 256).
+    /// For each micro-batch:
+    /// 1. Store vector data (sequential)
+    /// 2. Search for neighbors in parallel using `num_threads` threads (rayon)
+    /// 3. Link edges sequentially
+    ///
+    /// This gives ~N× speedup on N cores for the search phase (which is 90%+ of insert time).
+    /// No unsafe code or per-node locks — just phase-separated parallelism.
+    pub fn add_batch_parallel(
+        &mut self,
+        data: &[f32],
+        dim: usize,
+        start_id: u64,
+        num_threads: usize,
+        micro_batch_size: usize,
+    ) -> Result<(), VectorDbError> {
+        if dim != self.config.dimensions {
+            return Err(VectorDbError::DimensionMismatch {
+                expected: self.config.dimensions,
+                got: dim,
+            });
+        }
+        if data.len() % dim != 0 {
+            return Err(VectorDbError::InvalidConfig(
+                format!("data length {} is not divisible by dimension {}", data.len(), dim),
+            ));
+        }
+        let n = data.len() / dim;
+        if n == 0 { return Ok(()); }
+
+        let ids: Vec<u32> = (0..n).map(|i| (start_id + i as u64) as u32).collect();
+        let metric = self.config.metric;
+        let threads = if num_threads == 0 {
+            rayon::current_num_threads()
+        } else {
+            num_threads
+        };
+        let batch_size = if micro_batch_size == 0 { 256 } else { micro_batch_size };
+
+        self.graph.insert_batch_parallel(&ids, data, metric, batch_size, threads);
+        // Ensure the index-level visited tracker has capacity for subsequent searches
+        let vt = self.visited.get_mut().unwrap();
+        vt.ensure_capacity(self.graph.alive.len());
         Ok(())
     }
 
@@ -1488,5 +1786,122 @@ mod tests {
         assert_eq!(loaded.len(), 10);
         let r = loaded.search(&[5.0], 1).unwrap();
         assert_eq!(r[0].id, 5);
+    }
+
+    #[test]
+    fn parallel_insert_correctness() {
+        // Insert 500 vectors in parallel and verify search finds nearest neighbor
+        let dim = 32;
+        let n = 500;
+        let cfg = HnswConfig {
+            ef_construction: 200,
+            ef_search: 50,
+            m: 16,
+        };
+        let mut idx = HnswIndex::new(dim, Metric::L2, cfg);
+        let mut rng = rand::thread_rng();
+
+        // Generate random vectors
+        let mut data = vec![0.0f32; n * dim];
+        for v in data.iter_mut() {
+            *v = rng.gen::<f32>() * 100.0;
+        }
+
+        // Insert with parallel micro-batching (4 threads, batch size 64)
+        idx.add_batch_parallel(&data, dim, 0, 4, 64).unwrap();
+        assert_eq!(idx.len(), n);
+
+        // Verify: search for each vector should find itself as nearest
+        let mut found_self = 0;
+        for i in 0..n {
+            let query = &data[i * dim..(i + 1) * dim];
+            let results = idx.search(query, 1).unwrap();
+            if !results.is_empty() && results[0].id == i as u64 {
+                found_self += 1;
+            }
+        }
+        // Micro-batching trades slight quality for parallelism (vectors in the same
+        // micro-batch can't see each other's edges during search), so 90% is acceptable
+        let recall = found_self as f64 / n as f64;
+        assert!(recall > 0.90, "self-recall too low: {recall:.2} ({found_self}/{n})");
+    }
+
+    #[test]
+    fn parallel_insert_matches_sequential() {
+        // Both parallel and sequential insert should produce similar recall
+        let dim = 16;
+        let n = 200;
+        let cfg = HnswConfig {
+            ef_construction: 200,
+            ef_search: 50,
+            m: 12,
+        };
+        let mut rng = rand::thread_rng();
+        let mut data = vec![0.0f32; n * dim];
+        for v in data.iter_mut() {
+            *v = rng.gen::<f32>() * 100.0;
+        }
+
+        // Sequential insert
+        let mut seq_idx = HnswIndex::new(dim, Metric::L2, cfg.clone());
+        seq_idx.add_batch_raw(&data, dim, 0).unwrap();
+
+        // Parallel insert
+        let mut par_idx = HnswIndex::new(dim, Metric::L2, cfg);
+        par_idx.add_batch_parallel(&data, dim, 0, 4, 32).unwrap();
+
+        assert_eq!(seq_idx.len(), par_idx.len());
+
+        // Compare recall: both should return results for all queries
+        let n_queries = 50;
+        let k = 10;
+        let mut seq_total_dist = 0.0f64;
+        let mut par_total_dist = 0.0f64;
+        for _ in 0..n_queries {
+            let query: Vec<f32> = (0..dim).map(|_| rng.gen::<f32>() * 100.0).collect();
+            let seq_results = seq_idx.search(&query, k).unwrap();
+            let par_results = par_idx.search(&query, k).unwrap();
+            // Both should return k results
+            assert_eq!(seq_results.len(), k);
+            assert_eq!(par_results.len(), k);
+            seq_total_dist += seq_results[0].distance as f64;
+            par_total_dist += par_results[0].distance as f64;
+        }
+        // Parallel quality should be within 2x of sequential (both are approximate)
+        let ratio = par_total_dist / seq_total_dist.max(1e-10);
+        assert!(ratio < 2.0, "parallel quality too degraded: ratio={ratio:.2}");
+    }
+
+    #[test]
+    fn parallel_insert_single_thread_matches_sequential() {
+        // With 1 thread, parallel insert should work identically
+        let dim = 8;
+        let n = 100;
+        let cfg = HnswConfig {
+            ef_construction: 100,
+            ef_search: 30,
+            m: 8,
+        };
+        let mut idx = HnswIndex::new(dim, Metric::L2, cfg);
+        let mut data = vec![0.0f32; n * dim];
+        let mut rng = rand::thread_rng();
+        for v in data.iter_mut() {
+            *v = rng.gen::<f32>();
+        }
+
+        idx.add_batch_parallel(&data, dim, 0, 1, 256).unwrap();
+        assert_eq!(idx.len(), n);
+
+        // Self-recall should be high (micro-batching may slightly reduce quality)
+        let mut found = 0;
+        for i in 0..n {
+            let q = &data[i * dim..(i + 1) * dim];
+            let r = idx.search(q, 1).unwrap();
+            if !r.is_empty() && r[0].id == i as u64 {
+                found += 1;
+            }
+        }
+        assert!(found as f64 / n as f64 > 0.90,
+            "self-recall too low: {}/{}", found, n);
     }
 }

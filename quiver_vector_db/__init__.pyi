@@ -117,12 +117,33 @@ class HnswIndex:
     def add_batch_np(self, vectors: Any, start_id: int = 0) -> None:
         """Add vectors from a 2D numpy array (N x dim) with sequential IDs.
 
-        This is the fastest insert method — passes contiguous memory directly
-        to Rust with zero per-element Python overhead.
+        This is the fastest single-threaded insert method — passes contiguous
+        memory directly to Rust with zero per-element Python overhead.
 
         Args:
             vectors: 2D numpy array of shape (N, dim), dtype float32.
             start_id: First ID to assign (default 0). IDs are start_id..start_id+N-1.
+        """
+        ...
+
+    def add_batch_parallel(
+        self,
+        vectors: Any,
+        start_id: int = 0,
+        num_threads: int = 0,
+        micro_batch_size: int = 256,
+    ) -> None:
+        """Parallel batch insert from a 2D numpy array using micro-batching.
+
+        Uses rayon thread pool for multi-threaded neighbor search during insert.
+        The first micro-batch is inserted sequentially to bootstrap the graph,
+        then remaining batches use parallel search + sequential linking.
+
+        Args:
+            vectors: 2D numpy array of shape (N, dim), dtype float32.
+            start_id: First ID to assign (default 0).
+            num_threads: Number of threads (default 0 = all available cores).
+            micro_batch_size: Vectors per micro-batch (default 256).
         """
         ...
 
