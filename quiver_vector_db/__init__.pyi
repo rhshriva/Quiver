@@ -372,6 +372,22 @@ class Collection:
         """
         ...
 
+    def upsert_batch(
+        self,
+        entries: List[Union[
+            Tuple[int, List[float]],
+            Tuple[int, List[float], Optional[Dict[str, Any]]],
+        ]],
+    ) -> None:
+        """Batch insert or update multiple vectors at once.
+
+        More efficient than calling ``upsert`` in a loop.
+
+        Args:
+            entries: List of ``(id, vector)`` or ``(id, vector, payload)`` tuples.
+        """
+        ...
+
     def search(
         self,
         query: List[float],
@@ -726,3 +742,154 @@ class TextCollection:
     def delete(self, ids: Sequence[int]) -> None:
         """Delete documents by ID."""
         ...
+
+
+# ── Multi-Vector / Multi-Modal Collection ─────────────────────────────
+
+class MultiVectorCollection:
+    """A collection supporting multiple named vector spaces per document.
+
+    Stores image + text (or any combination of) embeddings for the same
+    document IDs, with cross-space fusion search.
+
+    Example::
+
+        multi = MultiVectorCollection(
+            client=db,
+            name="products",
+            vector_spaces={
+                "text":  {"dimensions": 384, "metric": "cosine"},
+                "image": {"dimensions": 512, "metric": "cosine"},
+            },
+        )
+        multi.upsert(id=1, vectors={"text": [...], "image": [...]}, payload={"title": "Shirt"})
+        hits = multi.search_multi(
+            queries={"text": [...], "image": [...]},
+            k=5,
+            weights={"text": 0.6, "image": 0.4},
+        )
+    """
+
+    name: str
+    """Base name of the multi-vector collection."""
+    vector_spaces: List[str]
+    """Sorted list of vector space names."""
+    count: int
+    """Number of documents (based on the primary space)."""
+
+    def __init__(
+        self,
+        client: Client,
+        name: str,
+        vector_spaces: Dict[str, Dict[str, Any]],
+        index_type: str = "hnsw",
+    ) -> None:
+        """
+        Args:
+            client: A ``Client`` instance.
+            name: Base name for the collection group.
+            vector_spaces: Mapping of space_name to config dict with
+                ``dimensions`` (int) and optionally ``metric`` (str).
+            index_type: Index algorithm for all sub-collections.
+        """
+        ...
+
+    def upsert(
+        self,
+        id: int,
+        vectors: Dict[str, List[float]],
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Insert or update a document with vectors in one or more spaces.
+
+        Args:
+            id: Unique integer ID.
+            vectors: Mapping of space_name to vector.
+            payload: Optional metadata dict.
+        """
+        ...
+
+    def upsert_batch(
+        self,
+        entries: Sequence[
+            Union[
+                Tuple[int, Dict[str, List[float]]],
+                Tuple[int, Dict[str, List[float]], Optional[Dict[str, Any]]],
+            ]
+        ],
+    ) -> None:
+        """Batch upsert multiple documents at once.
+
+        Args:
+            entries: List of ``(id, vectors)`` or ``(id, vectors, payload)`` tuples.
+        """
+        ...
+
+    def search(
+        self,
+        vector_space: str,
+        query: List[float],
+        k: int = 10,
+        filter: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Search within a single vector space.
+
+        Args:
+            vector_space: Which vector space to search.
+            query: Query vector.
+            k: Number of results.
+            filter: Optional payload filter.
+        """
+        ...
+
+    def search_multi(
+        self,
+        queries: Dict[str, List[float]],
+        k: int = 10,
+        weights: Optional[Dict[str, float]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Search across multiple spaces with weighted fusion.
+
+        Args:
+            queries: Mapping of space_name to query vector.
+            k: Number of results.
+            weights: Optional mapping of space_name to weight.
+
+        Returns:
+            List of dicts with ``id``, ``score``, and ``distances``.
+        """
+        ...
+
+    def delete(self, id: int) -> None:
+        """Delete a document across all vector spaces."""
+        ...
+
+    def delete_batch(self, ids: Sequence[int]) -> None:
+        """Delete multiple documents across all vector spaces."""
+        ...
+
+
+# ── REST API Server ───────────────────────────────────────────────────
+
+def create_server(
+    host: str = "0.0.0.0",
+    port: int = 8080,
+    data_path: str = "./data",
+) -> Any:
+    """Create a Quiver REST API server.
+
+    Usage::
+
+        server = create_server(port=9090, data_path="./my_data")
+        server.serve_forever()
+
+    Or from the command line::
+
+        python -m quiver_vector_db.server --port 9090 --data ./my_data
+
+    Args:
+        host: Bind address (default ``"0.0.0.0"``).
+        port: Port number (default ``8080``).
+        data_path: Path to data directory (default ``"./data"``).
+    """
+    ...
