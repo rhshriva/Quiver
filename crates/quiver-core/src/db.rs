@@ -134,6 +134,18 @@ impl Quiver {
         col.upsert(id, vector.to_vec(), payload)
     }
 
+    /// Batch insert or update multiple vectors at once. More efficient than
+    /// calling `upsert` in a loop.
+    pub fn upsert_batch(
+        &mut self,
+        collection: &str,
+        entries: Vec<(u64, Vec<f32>, Option<serde_json::Value>)>,
+    ) -> Result<(), VectorDbError> {
+        let col = self.manager.get_collection_mut(collection)
+            .ok_or_else(|| VectorDbError::CollectionNotFound(collection.to_string()))?;
+        col.upsert_batch(entries)
+    }
+
     /// Delete a vector by `id`. Returns `true` if the vector existed.
     pub fn delete(&mut self, collection: &str, id: u64) -> Result<bool, VectorDbError> {
         let col = self.manager.get_collection_mut(collection)

@@ -267,6 +267,35 @@ impl Collection {
         Ok(())
     }
 
+    /// Batch upsert multiple vectors at once. More efficient than calling
+    /// `upsert` in a loop because WAL compaction and promotion checks happen
+    /// only once at the end.
+    pub fn upsert_batch(
+        &mut self,
+        entries: Vec<(u64, Vec<f32>, Option<serde_json::Value>)>,
+    ) -> Result<(), VectorDbError> {
+        for (id, vector, payload) in entries {
+            let entry = WalEntry::Add {
+                id,
+                vector: vector.clone(),
+                payload_bytes: payload.as_ref()
+                    .map(|p| serde_json::to_vec(p).unwrap_or_default()),
+                sparse_bytes: None,
+            };
+            self.wal.append(&entry)?;
+
+            self.index.delete(id);
+            self.index.add(id, &vector)?;
+            match payload {
+                Some(p) => { self.payloads.insert(id, p); }
+                None => { self.payloads.remove(&id); }
+            }
+        }
+        self.maybe_compact()?;
+        self.maybe_promote()?;
+        Ok(())
+    }
+
     /// Upsert a vector with an optional sparse vector for hybrid search.
     ///
     /// The dense vector is stored in the main index. The sparse vector (if

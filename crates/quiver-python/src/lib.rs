@@ -1,6 +1,6 @@
 use pyo3::exceptions::{PyIOError, PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyDict, PyList, PyTuple};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::collections::HashMap;
@@ -745,6 +745,40 @@ impl PyCollection {
         let col = mgr.get_collection_mut(&name)
             .ok_or_else(|| PyKeyError::new_err(format!("collection '{name}' not found")))?;
         py.allow_threads(|| col.upsert(id, vector, p)).map_err(vec_err_to_py)
+    }
+
+    /// Batch insert or update multiple vectors at once. More efficient than
+    /// calling upsert in a loop.
+    ///
+    /// Args:
+    ///     entries: List of (id, vector) tuples or (id, vector, payload) tuples.
+    #[pyo3(signature = (entries))]
+    fn upsert_batch(&mut self, py: Python<'_>, entries: &Bound<'_, PyList>) -> PyResult<()> {
+        let mut batch: Vec<(u64, Vec<f32>, Option<serde_json::Value>)> = Vec::with_capacity(entries.len());
+        for item in entries.iter() {
+            let tuple = item.downcast::<PyTuple>()
+                .map_err(|_| PyValueError::new_err("each entry must be a tuple of (id, vector) or (id, vector, payload)"))?;
+            let len = tuple.len();
+            if len < 2 || len > 3 {
+                return Err(PyValueError::new_err(
+                    "each entry must be a tuple of (id, vector) or (id, vector, payload)"
+                ));
+            }
+            let id = tuple.get_item(0)?.extract::<u64>()?;
+            let vector = tuple.get_item(1)?.extract::<Vec<f32>>()?;
+            let payload = if len == 3 {
+                let p = tuple.get_item(2)?;
+                if p.is_none() { None } else { Some(py_to_json(&p)?) }
+            } else {
+                None
+            };
+            batch.push((id, vector, payload));
+        }
+        let name = self.name.clone();
+        let mut mgr = self.manager.write().unwrap();
+        let col = mgr.get_collection_mut(&name)
+            .ok_or_else(|| PyKeyError::new_err(format!("collection '{name}' not found")))?;
+        py.allow_threads(|| col.upsert_batch(batch)).map_err(vec_err_to_py)
     }
 
     /// Search for the k nearest vectors. Returns list of {"id", "distance", "payload"}.
