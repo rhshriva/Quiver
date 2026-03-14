@@ -1,6 +1,6 @@
 """Type stubs for quiver_vector_db — embedded vector database with Rust core."""
 
-from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Protocol, Sequence, Tuple, Union
 
 # ── Standalone Index Classes ───────────────────────────────────────────────
 
@@ -312,6 +312,35 @@ class MmapFlatIndex:
     def __repr__(self) -> str: ...
 
 
+class BinaryFlatIndex:
+    """Binary (1-bit) quantized brute-force index. 32x less RAM than FlatIndex.
+
+    Each f32 component is reduced to 1 bit (positive=1, negative=0).
+    Distance is computed via Hamming distance (popcount).
+    """
+
+    dimensions: int
+    metric: str
+
+    def __init__(
+        self,
+        dimensions: int,
+        metric: Literal["l2", "cosine", "dot_product"] = "l2",
+    ) -> None: ...
+
+    def add(self, id: int, vector: List[float]) -> None: ...
+    def add_batch(self, entries: List[Tuple[int, List[float]]]) -> None: ...
+    def search(self, query: List[float], k: int) -> List[Dict[str, Any]]: ...
+    def delete(self, id: int) -> bool: ...
+    def save(self, path: str) -> None: ...
+
+    @staticmethod
+    def load(path: str) -> "BinaryFlatIndex": ...
+
+    def __len__(self) -> int: ...
+    def __repr__(self) -> str: ...
+
+
 # ── Collection & Client ───────────────────────────────────────────────────
 
 class Collection:
@@ -340,6 +369,22 @@ class Collection:
             id: Unique integer ID.
             vector: Dense vector.
             payload: Optional JSON-serializable metadata dict.
+        """
+        ...
+
+    def upsert_batch(
+        self,
+        entries: List[Union[
+            Tuple[int, List[float]],
+            Tuple[int, List[float], Optional[Dict[str, Any]]],
+        ]],
+    ) -> None:
+        """Batch insert or update multiple vectors at once.
+
+        More efficient than calling ``upsert`` in a loop.
+
+        Args:
+            entries: List of ``(id, vector)`` or ``(id, vector, payload)`` tuples.
         """
         ...
 
@@ -411,6 +456,41 @@ class Collection:
         """Delete a vector by ID. Returns True if found and removed."""
         ...
 
+    def create_snapshot(self, name: str) -> Dict[str, Any]:
+        """Create a named snapshot of this collection's current state.
+
+        Returns:
+            Dict with keys ``name``, ``created_at``, ``vector_count``, ``sparse_count``.
+
+        Raises:
+            KeyError: If a snapshot with this name already exists.
+        """
+        ...
+
+    def list_snapshots(self) -> List[Dict[str, Any]]:
+        """List all snapshots, sorted by creation time.
+
+        Returns:
+            List of dicts with keys ``name``, ``created_at``, ``vector_count``, ``sparse_count``.
+        """
+        ...
+
+    def restore_snapshot(self, name: str) -> None:
+        """Restore this collection to the state captured by snapshot ``name``.
+
+        Raises:
+            KeyError: If snapshot does not exist.
+        """
+        ...
+
+    def delete_snapshot(self, name: str) -> None:
+        """Delete a snapshot by name.
+
+        Raises:
+            KeyError: If snapshot does not exist.
+        """
+        ...
+
     def __repr__(self) -> str: ...
 
 
@@ -441,7 +521,7 @@ class Client:
         metric: Literal["cosine", "l2", "dot_product"] = "cosine",
         index_type: Literal[
             "hnsw", "flat", "quantized_flat", "fp16_flat",
-            "ivf", "ivf_pq", "mmap_flat",
+            "ivf", "ivf_pq", "mmap_flat", "binary_flat",
         ] = "hnsw",
     ) -> Collection:
         """Create a new collection.
@@ -489,3 +569,327 @@ class Client:
         ...
 
     def __repr__(self) -> str: ...
+
+
+# ── Embedding Function Protocol ───────────────────────────────────────
+
+class EmbeddingFunction(Protocol):
+    """Protocol that any embedding provider must satisfy.
+
+    Implement ``__call__`` to embed a batch of texts, and optionally
+    ``dimensions`` to report the output dimensionality.
+    """
+
+    def __call__(self, texts: List[str]) -> List[List[float]]: ...
+
+    @property
+    def dimensions(self) -> Optional[int]: ...
+
+
+class SentenceTransformerEmbedding:
+    """Local embedding via sentence-transformers.
+
+    Requires: ``pip install quiver-vector-db[sentence-transformers]``
+    """
+
+    def __init__(
+        self,
+        model_name: str = "all-MiniLM-L6-v2",
+        device: Optional[str] = None,
+    ) -> None: ...
+
+    def __call__(self, texts: List[str]) -> List[List[float]]: ...
+
+    @property
+    def dimensions(self) -> int: ...
+
+
+class OpenAIEmbedding:
+    """OpenAI embedding API wrapper.
+
+    Requires: ``pip install quiver-vector-db[openai]``
+    """
+
+    def __init__(
+        self,
+        model: str = "text-embedding-3-small",
+        api_key: Optional[str] = None,
+        dimensions: Optional[int] = None,
+    ) -> None: ...
+
+    def __call__(self, texts: List[str]) -> List[List[float]]: ...
+
+    @property
+    def dimensions(self) -> Optional[int]: ...
+
+
+# ── BM25 ──────────────────────────────────────────────────────────────
+
+class BM25:
+    """Okapi BM25 tokenizer and sparse vector generator.
+
+    Produces sparse vectors compatible with ``Collection.upsert_hybrid()``.
+    """
+
+    doc_count: int
+    """Total number of indexed documents."""
+    vocab_size: int
+    """Number of unique terms in the vocabulary."""
+    avg_dl: float
+    """Average document length (in tokens)."""
+
+    def __init__(self, k1: float = 1.5, b: float = 0.75) -> None: ...
+
+    def index_document(self, doc_id: int, text: str) -> Dict[int, float]:
+        """Tokenize and index a document. Returns BM25 sparse vector."""
+        ...
+
+    def encode_query(self, text: str) -> Dict[int, float]:
+        """Encode a query into an IDF-weighted sparse vector."""
+        ...
+
+    def remove_document(self, doc_id: int) -> None:
+        """Remove a document's contribution to global stats."""
+        ...
+
+    def save(self, path: str) -> None:
+        """Serialize BM25 state to a JSON file."""
+        ...
+
+    @classmethod
+    def load(cls, path: str) -> "BM25":
+        """Load BM25 state from a JSON file."""
+        ...
+
+
+# ── TextCollection ────────────────────────────────────────────────────
+
+class TextCollection:
+    """Document-oriented collection with automatic embedding + BM25.
+
+    Wraps a Rust ``Collection`` and provides text-in / text-out methods.
+
+    Example::
+
+        text_col = TextCollection(col, SentenceTransformerEmbedding())
+        text_col.add(ids=[1, 2], documents=["Hello", "World"])
+        hits = text_col.query("greeting", k=5)
+    """
+
+    count: int
+    """Number of documents in the collection."""
+    name: str
+    """Collection name."""
+
+    def __init__(
+        self,
+        collection: Collection,
+        embedding_function: EmbeddingFunction,
+        enable_bm25: bool = True,
+        bm25_k1: float = 1.5,
+        bm25_b: float = 0.75,
+    ) -> None:
+        """
+        Args:
+            collection: A Rust ``Collection`` from ``Client.create_collection()``.
+            embedding_function: Any callable satisfying ``EmbeddingFunction``.
+            enable_bm25: Enable BM25 full-text indexing (default True).
+            bm25_k1: BM25 k1 parameter (term frequency saturation).
+            bm25_b: BM25 b parameter (document length normalization).
+        """
+        ...
+
+    def add(
+        self,
+        ids: Sequence[int],
+        documents: Sequence[str],
+        payloads: Optional[Sequence[Optional[Dict[str, Any]]]] = None,
+    ) -> None:
+        """Add documents by text. Handles embedding and BM25 indexing.
+
+        Args:
+            ids: Unique integer IDs.
+            documents: Text strings to embed and index.
+            payloads: Optional metadata dicts (one per document).
+        """
+        ...
+
+    def query(
+        self,
+        query_text: str,
+        k: int = 10,
+        mode: Literal["hybrid", "semantic", "keyword"] = "hybrid",
+        dense_weight: float = 0.7,
+        sparse_weight: float = 0.3,
+        filter: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Search by natural language query.
+
+        Args:
+            query_text: Natural language query string.
+            k: Number of results to return.
+            mode: ``"hybrid"`` (default), ``"semantic"``, or ``"keyword"``.
+            dense_weight: Weight for dense similarity (hybrid mode).
+            sparse_weight: Weight for keyword similarity (hybrid mode).
+            filter: Optional payload filter dict.
+
+        Returns:
+            List of result dicts with ``id``, ``document``, ``payload``,
+            and either ``distance`` (semantic) or ``score`` (hybrid/keyword).
+        """
+        ...
+
+    def delete(self, ids: Sequence[int]) -> None:
+        """Delete documents by ID."""
+        ...
+
+
+# ── Multi-Vector / Multi-Modal Collection ─────────────────────────────
+
+class MultiVectorCollection:
+    """A collection supporting multiple named vector spaces per document.
+
+    Stores image + text (or any combination of) embeddings for the same
+    document IDs, with cross-space fusion search.
+
+    Example::
+
+        multi = MultiVectorCollection(
+            client=db,
+            name="products",
+            vector_spaces={
+                "text":  {"dimensions": 384, "metric": "cosine"},
+                "image": {"dimensions": 512, "metric": "cosine"},
+            },
+        )
+        multi.upsert(id=1, vectors={"text": [...], "image": [...]}, payload={"title": "Shirt"})
+        hits = multi.search_multi(
+            queries={"text": [...], "image": [...]},
+            k=5,
+            weights={"text": 0.6, "image": 0.4},
+        )
+    """
+
+    name: str
+    """Base name of the multi-vector collection."""
+    vector_spaces: List[str]
+    """Sorted list of vector space names."""
+    count: int
+    """Number of documents (based on the primary space)."""
+
+    def __init__(
+        self,
+        client: Client,
+        name: str,
+        vector_spaces: Dict[str, Dict[str, Any]],
+        index_type: str = "hnsw",
+    ) -> None:
+        """
+        Args:
+            client: A ``Client`` instance.
+            name: Base name for the collection group.
+            vector_spaces: Mapping of space_name to config dict with
+                ``dimensions`` (int) and optionally ``metric`` (str).
+            index_type: Index algorithm for all sub-collections.
+        """
+        ...
+
+    def upsert(
+        self,
+        id: int,
+        vectors: Dict[str, List[float]],
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Insert or update a document with vectors in one or more spaces.
+
+        Args:
+            id: Unique integer ID.
+            vectors: Mapping of space_name to vector.
+            payload: Optional metadata dict.
+        """
+        ...
+
+    def upsert_batch(
+        self,
+        entries: Sequence[
+            Union[
+                Tuple[int, Dict[str, List[float]]],
+                Tuple[int, Dict[str, List[float]], Optional[Dict[str, Any]]],
+            ]
+        ],
+    ) -> None:
+        """Batch upsert multiple documents at once.
+
+        Args:
+            entries: List of ``(id, vectors)`` or ``(id, vectors, payload)`` tuples.
+        """
+        ...
+
+    def search(
+        self,
+        vector_space: str,
+        query: List[float],
+        k: int = 10,
+        filter: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Search within a single vector space.
+
+        Args:
+            vector_space: Which vector space to search.
+            query: Query vector.
+            k: Number of results.
+            filter: Optional payload filter.
+        """
+        ...
+
+    def search_multi(
+        self,
+        queries: Dict[str, List[float]],
+        k: int = 10,
+        weights: Optional[Dict[str, float]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Search across multiple spaces with weighted fusion.
+
+        Args:
+            queries: Mapping of space_name to query vector.
+            k: Number of results.
+            weights: Optional mapping of space_name to weight.
+
+        Returns:
+            List of dicts with ``id``, ``score``, and ``distances``.
+        """
+        ...
+
+    def delete(self, id: int) -> None:
+        """Delete a document across all vector spaces."""
+        ...
+
+    def delete_batch(self, ids: Sequence[int]) -> None:
+        """Delete multiple documents across all vector spaces."""
+        ...
+
+
+# ── REST API Server ───────────────────────────────────────────────────
+
+def create_server(
+    host: str = "0.0.0.0",
+    port: int = 8080,
+    data_path: str = "./data",
+) -> Any:
+    """Create a Quiver REST API server.
+
+    Usage::
+
+        server = create_server(port=9090, data_path="./my_data")
+        server.serve_forever()
+
+    Or from the command line::
+
+        python -m quiver_vector_db.server --port 9090 --data ./my_data
+
+    Args:
+        host: Bind address (default ``"0.0.0.0"``).
+        port: Port number (default ``8080``).
+        data_path: Path to data directory (default ``"./data"``).
+    """
+    ...

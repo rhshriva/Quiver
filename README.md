@@ -5,6 +5,8 @@ No server, no network — runs fully in-process with SIMD-accelerated search.
 
 ## Features
 
+- **Built-in embeddings** — pass text, get vectors automatically (sentence-transformers, OpenAI)
+- **Full-text search** — BM25 keyword search with automatic hybrid dense+sparse fusion
 - **7 index types** — HNSW, Flat, Int8/FP16 quantized, IVF, IVF-PQ, memory-mapped
 - **3 distance metrics** — Cosine, L2, Dot Product with AVX2/NEON SIMD
 - **Hybrid search** — combine dense vectors with sparse keyword signals (BM25/SPLADE)
@@ -46,6 +48,35 @@ for hit in hits:
 
 Collections are persisted via WAL — reopen the same path and everything is restored.
 
+### Text-first (with built-in embeddings)
+
+```python
+import quiver_vector_db as quiver
+from quiver_vector_db import TextCollection, SentenceTransformerEmbedding
+
+db  = quiver.Client(path="./my_data")
+col = db.create_collection("docs", dimensions=384, metric="cosine")
+
+# Wrap with automatic embedding + BM25
+text_col = TextCollection(col, SentenceTransformerEmbedding("all-MiniLM-L6-v2"))
+
+text_col.add(ids=[1, 2], documents=["Hello world", "Vector search is fast"])
+
+# Hybrid search (semantic + keyword) — default mode
+hits = text_col.query("greeting message", k=5)
+
+# Semantic only
+hits = text_col.query("greeting", k=5, mode="semantic")
+
+# Keyword only (BM25)
+hits = text_col.query("hello", k=5, mode="keyword")
+
+for hit in hits:
+    print(hit["id"], hit["document"], hit.get("score") or hit.get("distance"))
+```
+
+Requires: `pip install quiver-vector-db[sentence-transformers]` or `pip install quiver-vector-db[openai]`
+
 ---
 
 ## API Reference
@@ -76,6 +107,48 @@ Returned by `Client.create_collection()` or `Client.get_collection()`.
 | `count` | Property: number of dense vectors |
 | `sparse_count` | Property: number of sparse vectors |
 | `name` | Property: collection name |
+
+### `TextCollection(collection, embedding_function, enable_bm25=True)`
+
+Document-oriented wrapper with automatic embedding and BM25 full-text search.
+
+| Method | Description |
+|--------|-------------|
+| `add(ids, documents, payloads=None)` | Embed texts and index. Accepts lists. |
+| `query(query_text, k=10, mode="hybrid", dense_weight=0.7, sparse_weight=0.3, filter=None)` | Search by text. Mode: `"hybrid"`, `"semantic"`, `"keyword"` |
+| `delete(ids)` | Delete documents by ID |
+| `count` | Property: number of documents |
+| `name` | Property: collection name |
+
+### Embedding Functions
+
+| Class | Provider | Install |
+|-------|----------|---------|
+| `SentenceTransformerEmbedding(model_name, device=None)` | Local models | `pip install quiver-vector-db[sentence-transformers]` |
+| `OpenAIEmbedding(model, api_key=None)` | OpenAI API | `pip install quiver-vector-db[openai]` |
+
+Implement the `EmbeddingFunction` protocol to bring your own embedder:
+
+```python
+class MyEmbedder:
+    def __call__(self, texts: list[str]) -> list[list[float]]:
+        return [my_model.encode(t) for t in texts]
+
+    @property
+    def dimensions(self) -> int:
+        return 384
+```
+
+### `BM25(k1=1.5, b=0.75)`
+
+Standalone BM25 tokenizer for generating sparse vectors from text.
+
+| Method | Description |
+|--------|-------------|
+| `index_document(doc_id, text)` | Tokenize and index. Returns sparse vector `{dim: weight}` |
+| `encode_query(text)` | Encode query to IDF-weighted sparse vector |
+| `remove_document(doc_id)` | Remove document from IDF stats |
+| `save(path)` / `BM25.load(path)` | Persist and restore BM25 state |
 
 ### Standalone Index Classes
 
