@@ -348,15 +348,27 @@ class TestInsertThroughput:
         BENCH_M = 16
         BENCH_EF_CONSTRUCTION = 200
 
-        # Quiver HNSW (numpy batch — same style as faiss/hnswlib)
+        import os
+        n_cores = os.cpu_count() or 1
+        vectors_np = np.array(vectors_list, dtype=np.float32)
+
+        # Quiver HNSW — single-threaded (numpy batch)
         idx = quiver.HnswIndex(dimensions=DIM, metric="l2",
                                m=BENCH_M, ef_construction=BENCH_EF_CONSTRUCTION)
-        vectors_np = np.array(vectors_list, dtype=np.float32)
         t0 = time.perf_counter()
         idx.add_batch_np(vectors_np)
         idx.flush()
         elapsed = time.perf_counter() - t0
         rows.append(("Quiver HNSW (1T)", f"{elapsed:.3f}s", f"{N/elapsed:,.0f}"))
+
+        # Quiver HNSW — parallel micro-batching (all cores)
+        idx_par = quiver.HnswIndex(dimensions=DIM, metric="l2",
+                                   m=BENCH_M, ef_construction=BENCH_EF_CONSTRUCTION)
+        t0 = time.perf_counter()
+        idx_par.add_batch_parallel(vectors_np, num_threads=n_cores)
+        idx_par.flush()
+        elapsed = time.perf_counter() - t0
+        rows.append((f"Quiver HNSW ({n_cores}T)", f"{elapsed:.3f}s", f"{N/elapsed:,.0f}"))
 
         # hnswlib — single-threaded for fair comparison
         hnswlib = try_import("hnswlib")

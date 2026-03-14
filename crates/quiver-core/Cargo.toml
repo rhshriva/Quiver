@@ -18,6 +18,7 @@ bincode = { workspace = true }
 lru = { workspace = true }
 memmap2 = { workspace = true }
 half = { workspace = true }
+rayon = { workspace = true }
 faiss = { workspace = true, optional = true }
 
 [dev-dependencies]

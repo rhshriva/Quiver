@@ -369,6 +369,34 @@ impl PyHnswIndex {
         })
     }
 
+    /// Parallel batch insert from a 2D numpy array using micro-batching.
+    ///
+    /// Splits the batch into micro-batches, inserts the first batch sequentially
+    /// (bootstrapping the graph), then processes remaining batches with parallel
+    /// neighbor search using `num_threads` threads.
+    ///
+    /// Args:
+    ///     vectors: 2D numpy array of shape (N, dim), dtype float32
+    ///     start_id: First vector ID (default 0)
+    ///     num_threads: Number of threads (default 0 = all cores)
+    ///     micro_batch_size: Vectors per micro-batch (default 256)
+    #[cfg(any(not(Py_LIMITED_API), Py_3_11))]
+    #[pyo3(signature = (vectors, start_id = 0, num_threads = 0, micro_batch_size = 256))]
+    fn add_batch_parallel(
+        &mut self,
+        py: Python<'_>,
+        vectors: &Bound<'_, PyAny>,
+        start_id: u64,
+        num_threads: usize,
+        micro_batch_size: usize,
+    ) -> PyResult<()> {
+        let (data, _n_rows, n_cols) = extract_2d_f32_buffer(vectors)?;
+        py.allow_threads(|| {
+            self.inner.add_batch_parallel(&data, n_cols, start_id, num_threads, micro_batch_size)
+                .map_err(vec_err_to_py)
+        })
+    }
+
     fn search(&self, py: Python<'_>, query: &Bound<'_, PyAny>, k: usize) -> PyResult<Vec<PyObject>> {
         let q = extract_f32_vec(query)?;
         let results = py.allow_threads(|| self.inner.search(&q, k)).map_err(vec_err_to_py)?;
