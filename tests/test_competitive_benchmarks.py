@@ -348,10 +348,10 @@ class TestCompetitiveBenchmarks:
         idx.add_batch_np(vectors_np)
         q_ivf_insert = N / (time.perf_counter() - t0)
         q_ivf_lat, q_ivf_rec = measure_quiver("ivf", idx, queries_list)
-        rows.append(("Quiver IVF", f"{q_ivf_insert:,.0f}",
+        rows.append(("Quiver IVF-Flat", f"{q_ivf_insert:,.0f}",
                       f"{q_ivf_lat:.3f}", f"{q_ivf_rec:.4f}"))
 
-        # faiss IVFFlat
+        # faiss IVF-Flat
         if faiss:
             faiss.omp_set_num_threads(1)
             quantizer = faiss.IndexFlatL2(DIM)
@@ -362,10 +362,10 @@ class TestCompetitiveBenchmarks:
             f_ivf_insert = N / (time.perf_counter() - t0)
             idx_f.nprobe = self.BENCH_NPROBE
             f_ivf_lat, f_ivf_rec = measure_faiss(idx_f, queries_np)
-            rows.append(("faiss IVFFlat", f"{f_ivf_insert:,.0f}",
+            rows.append(("faiss IVF-Flat", f"{f_ivf_insert:,.0f}",
                           f"{f_ivf_lat:.3f}", f"{f_ivf_rec:.4f}"))
         else:
-            rows.append(("faiss IVFFlat", "SKIP", "SKIP", "SKIP"))
+            rows.append(("faiss IVF-Flat", "SKIP", "SKIP", "SKIP"))
 
         rows.append(("---", "---", "---", "---"))
 

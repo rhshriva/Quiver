@@ -78,8 +78,8 @@ All Quiver indexes use `add_batch_np` (numpy buffer protocol) for fair compariso
 | **Quiver Int8** | **15,028K** | **0.060** | 0.9940 |
 | faiss SQ8 | 5,961K | 0.095 | 0.9930 |
 | | | | |
-| **Quiver IVF** | 182K | 0.017 | 0.6110 |
-| faiss IVFFlat | 1,245K | 0.009 | 0.5670 |
+| **Quiver IVF-Flat** | 182K | 0.017 | 0.6110 |
+| faiss IVF-Flat | 1,245K | 0.009 | 0.5670 |
 | | | | |
 | **Quiver IVF-PQ** | 63K | 0.014 | 0.0720 |
 | faiss IVFPQ | 132K | 0.008 | 0.0690 |
