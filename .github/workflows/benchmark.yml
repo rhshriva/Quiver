@@ -30,17 +30,21 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install Python dependencies
+      - name: Create virtualenv and install dependencies
         run: |
+          python -m venv .venv
+          source .venv/bin/activate
           pip install maturin pytest numpy faiss-cpu usearch lancedb
 
       - name: Build Quiver (release)
         run: |
+          source .venv/bin/activate
           maturin develop --release -m crates/quiver-python/Cargo.toml
 
       - name: Run competitive benchmarks
         id: bench
         run: |
+          source .venv/bin/activate
           echo "## Performance Benchmarks — ${{ matrix.arch }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
