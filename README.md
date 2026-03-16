@@ -130,7 +130,7 @@ Benchmarks run on **GitHub Actions** CI runners — fully reproducible via `work
 | Mmap | 1,155K | 0.060 | 1.0000 | | 1,125K | 0.068 | 1.0000 |
 | Binary | 1,108K | 0.034 | 0.1130 | | 1,721K | 0.027 | 0.1140 |
 
-> FP16, Mmap, and Binary indexes are **unique to Quiver** — not available in faiss, usearch, or LanceDB.
+> FP16, Mmap, and Binary indexes are not offered by the competitors benchmarked above (faiss, usearch, LanceDB).
 
 ### Key Takeaways
 
@@ -138,8 +138,8 @@ Benchmarks run on **GitHub Actions** CI runners — fully reproducible via `work
 - **HNSW search**: Quiver **0.039ms** — **1.2x faster** than faiss (0.047ms), **2.4x faster** than usearch (0.094ms)
 - **HNSW single-thread insert**: Quiver 11.7K — **1.3x faster** than faiss (9.0K)
 - **Int8 insert on ARM64**: Quiver **4.3M** — **1.3x faster** than faiss SQ8 (3.3M)
-- **Recall parity**: Quiver matches or exceeds competitors across all index types
-- **3 unique index types** (FP16, Mmap, Binary) not available in any competitor
+- **Competitive recall**: Quiver recall is within 1–2% of faiss across index types (e.g., HNSW 0.941 vs 0.951)
+- **3 additional index types** (FP16, Mmap, Binary) not offered by the competitors benchmarked above
 
 Reproduce locally: `pip install quiver-vector-db[benchmark] && pytest tests/test_competitive_benchmarks.py -v -s`
 Reproduce on CI: trigger the **Performance Benchmarks** workflow from the [Actions tab](https://github.com/rhshriva/Quiver/actions/workflows/benchmark.yml)

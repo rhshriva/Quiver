@@ -526,10 +526,10 @@ Store vectors on disk and let the OS virtual memory system page them in on deman
 
 ### Mutation Model
 
-Writes go to an in-memory staging buffer. Deletes go to a tombstone set. Only on `flush()` does the data get written to the mmap file:
+Writes go to an in-memory staging map (`HashMap<u64, Vec<f32>>`). Deletes go to a tombstone set. Only on `flush()` does the data get written to the mmap file:
 
 ```
-Insert → staging_buffer (in-memory Vec)
+Insert → staging map (in-memory HashMap<u64, Vec<f32>>)
 Delete → tombstones (HashSet)
 Search → scan mmap file + staging_buffer, skip tombstones
 Flush  → compact (remove tombstones) + append staging → remap file
